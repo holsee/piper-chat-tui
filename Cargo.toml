@@ -1,0 +1,19 @@
+[package]
+name = "piper-chat"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+iroh = { version = "0.96", default-features = false }
+iroh-gossip = { version = "0.96", default-features = false, features = ["net"] }
+iroh-tickets = "0.3"
+n0-future = "0.3"
+postcard = { version = "1", features = ["alloc"] }
+rand = "0.9"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
