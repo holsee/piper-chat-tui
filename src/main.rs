@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 use clap::Parser;
@@ -49,7 +49,14 @@ enum Cli {
 
 #[derive(Serialize, Deserialize)]
 enum Message {
-    Chat { nickname: String, text: String },
+    Join {
+        nickname: String,
+        endpoint_id: EndpointId,
+    },
+    Chat {
+        nickname: String,
+        text: String,
+    },
 }
 
 // ── Ticket ───────────────────────────────────────────────────────────────────
@@ -93,6 +100,7 @@ struct App {
     input: String,
     cursor_pos: usize,
     should_quit: bool,
+    peers: BTreeMap<EndpointId, String>,
 }
 
 impl App {
@@ -102,6 +110,7 @@ impl App {
             input: String::new(),
             cursor_pos: 0,
             should_quit: false,
+            peers: BTreeMap::new(),
         }
     }
 
@@ -117,9 +126,10 @@ impl App {
 // ── UI ───────────────────────────────────────────────────────────────────────
 
 fn ui(f: &mut ratatui::Frame, app: &App) {
-    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(f.area());
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(f.area());
+    let top = Layout::horizontal([Constraint::Min(1), Constraint::Length(20)]).split(rows[0]);
 
-    // Messages pane
+    // Messages pane (top left)
     let lines: Vec<Line> = app
         .messages
         .iter()
@@ -142,23 +152,38 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
         })
         .collect();
 
-    let visible = chunks[0].height.saturating_sub(2) as usize;
+    let visible = top[0].height.saturating_sub(2) as usize;
     let scroll = lines.len().saturating_sub(visible) as u16;
 
     let messages_widget = Paragraph::new(lines)
         .scroll((scroll, 0))
         .block(Block::default().borders(Borders::ALL).title("piper-chat"));
-    f.render_widget(messages_widget, chunks[0]);
+    f.render_widget(messages_widget, top[0]);
 
-    // Input pane
+    // Peers pane (top right)
+    let peer_lines: Vec<Line> = app
+        .peers
+        .values()
+        .map(|name| {
+            Line::from(Span::styled(
+                name.as_str(),
+                Style::default().fg(Color::Green),
+            ))
+        })
+        .collect();
+    let peers_widget = Paragraph::new(peer_lines)
+        .block(Block::default().borders(Borders::ALL).title("peers"));
+    f.render_widget(peers_widget, top[1]);
+
+    // Input pane (full width)
     let input_widget = Paragraph::new(format!("> {}", app.input))
         .block(Block::default().borders(Borders::ALL));
-    f.render_widget(input_widget, chunks[1]);
+    f.render_widget(input_widget, rows[1]);
 
     // Cursor position
     f.set_cursor_position((
-        chunks[1].x + 2 + app.cursor_pos as u16,
-        chunks[1].y + 1,
+        rows[1].x + 2 + app.cursor_pos as u16,
+        rows[1].y + 1,
     ));
 }
 
@@ -212,7 +237,9 @@ async fn main() -> Result<()> {
         std::io::stdout(),
     ))?;
 
+    let our_id = endpoint.id();
     let mut app = App::new();
+    app.peers.insert(our_id, format!("{nickname} (you)"));
     app.system(format!("ticket: {ticket_str}"));
     app.system("waiting for peers...");
 
@@ -269,17 +296,31 @@ async fn main() -> Result<()> {
             msg = receiver.try_next() => {
                 match msg {
                     Ok(Some(GossipEvent::Received(msg))) => {
-                        if let Ok(Message::Chat { nickname, text }) =
-                            postcard::from_bytes(&msg.content)
-                        {
-                            app.chat(nickname, text);
+                        match postcard::from_bytes(&msg.content) {
+                            Ok(Message::Join { nickname: name, endpoint_id }) => {
+                                app.system(format!("{name} joined"));
+                                app.peers.insert(endpoint_id, name);
+                            }
+                            Ok(Message::Chat { nickname, text }) => {
+                                app.chat(nickname, text);
+                            }
+                            Err(_) => {}
                         }
                     }
                     Ok(Some(GossipEvent::NeighborUp(id))) => {
-                        app.system(format!("peer joined: {}", id.fmt_short()));
+                        app.peers.insert(id, id.fmt_short().to_string());
+                        app.system(format!("peer connected: {}", id.fmt_short()));
+                        // Announce ourselves so the new peer learns our name
+                        let join = Message::Join {
+                            nickname: nickname.clone(),
+                            endpoint_id: our_id,
+                        };
+                        let encoded = postcard::to_stdvec(&join)?;
+                        sender.broadcast(encoded.into()).await?;
                     }
                     Ok(Some(GossipEvent::NeighborDown(id))) => {
-                        app.system(format!("peer left: {}", id.fmt_short()));
+                        let name = app.peers.remove(&id).unwrap_or_else(|| id.fmt_short().to_string());
+                        app.system(format!("{name} left"));
                     }
                     Ok(Some(GossipEvent::Lagged)) => {
                         app.system("warning: gossip stream lagged");
