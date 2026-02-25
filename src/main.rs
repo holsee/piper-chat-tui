@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
-    event::{Event as TermEvent, EventStream, KeyCode, KeyEventKind},
+    event::{Event as TermEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -18,10 +18,10 @@ use iroh_gossip::{
 use iroh_tickets::Ticket;
 use n0_future::StreamExt;
 use ratatui::{
-    layout::{Constraint, Layout},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, interval};
@@ -29,8 +29,14 @@ use tokio::time::{Duration, interval};
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "piper-chat")]
-enum Cli {
+#[command(name = "piper-chat", about = "P2P terminal chat over iroh gossip")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
     /// Create a new chat room
     Create {
         /// Your display name
@@ -138,10 +144,380 @@ impl EndpointHooks for ConnTrackerHook {
     }
 }
 
+// ── Welcome screen ──────────────────────────────────────────────────────────
+
+#[derive(PartialEq)]
+enum WelcomeField {
+    Name,
+    Mode,
+    Ticket,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum RoomMode {
+    Create,
+    Join,
+}
+
+struct WelcomeState {
+    field: WelcomeField,
+    name: String,
+    name_cursor: usize,
+    mode: RoomMode,
+    ticket: String,
+    ticket_cursor: usize,
+    error: Option<String>,
+    should_quit: bool,
+}
+
+impl WelcomeState {
+    fn new() -> Self {
+        Self {
+            field: WelcomeField::Name,
+            name: String::new(),
+            name_cursor: 0,
+            mode: RoomMode::Create,
+            ticket: String::new(),
+            ticket_cursor: 0,
+            error: None,
+            should_quit: false,
+        }
+    }
+
+    fn next_field(&mut self) {
+        self.field = match self.field {
+            WelcomeField::Name => WelcomeField::Mode,
+            WelcomeField::Mode => {
+                if self.mode == RoomMode::Join {
+                    WelcomeField::Ticket
+                } else {
+                    WelcomeField::Name
+                }
+            }
+            WelcomeField::Ticket => WelcomeField::Name,
+        };
+    }
+
+    fn prev_field(&mut self) {
+        self.field = match self.field {
+            WelcomeField::Name => {
+                if self.mode == RoomMode::Join {
+                    WelcomeField::Ticket
+                } else {
+                    WelcomeField::Mode
+                }
+            }
+            WelcomeField::Mode => WelcomeField::Name,
+            WelcomeField::Ticket => WelcomeField::Mode,
+        };
+    }
+}
+
+enum WelcomeResult {
+    Create { nickname: String },
+    Join { nickname: String, ticket: String },
+}
+
+fn ui_welcome(f: &mut ratatui::Frame, state: &WelcomeState) {
+    let area = f.area();
+
+    // Centered card: 50 wide, 14 tall
+    let card_w: u16 = 52;
+    let card_h: u16 = 14;
+    let x = area.width.saturating_sub(card_w) / 2;
+    let y = area.height.saturating_sub(card_h) / 2;
+    let card = Rect::new(x, y, card_w.min(area.width), card_h.min(area.height));
+
+    // Clear background and draw border
+    f.render_widget(Clear, card);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" piper-chat ")
+        .title_alignment(Alignment::Center);
+    f.render_widget(block, card);
+
+    let inner = Rect::new(card.x + 2, card.y + 1, card.width.saturating_sub(4), card.height.saturating_sub(2));
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Subtitle
+    lines.push(Line::from(Span::styled(
+        "P2P terminal chat over iroh gossip",
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+    )));
+    lines.push(Line::from(""));
+
+    // Name field
+    let name_style = if state.field == WelcomeField::Name {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let name_label = if state.field == WelcomeField::Name { "> Name: " } else { "  Name: " };
+    lines.push(Line::from(vec![
+        Span::styled(name_label, name_style),
+        Span::styled(&state.name, Style::default().fg(Color::White)),
+        if state.field == WelcomeField::Name {
+            Span::styled("_", Style::default().fg(Color::DarkGray))
+        } else {
+            Span::raw("")
+        },
+    ]));
+    lines.push(Line::from(""));
+
+    // Mode field
+    let mode_style = if state.field == WelcomeField::Mode {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let mode_label = if state.field == WelcomeField::Mode { "> Mode: " } else { "  Mode: " };
+    let (create_style, join_style) = match state.mode {
+        RoomMode::Create => (
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::DarkGray),
+        ),
+        RoomMode::Join => (
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(mode_label, mode_style),
+        Span::styled(" Create ", create_style),
+        Span::raw("  "),
+        Span::styled(" Join ", join_style),
+    ]));
+    lines.push(Line::from(""));
+
+    // Ticket field
+    let ticket_active = state.mode == RoomMode::Join;
+    let ticket_style = if !ticket_active {
+        Style::default().fg(Color::DarkGray)
+    } else if state.field == WelcomeField::Ticket {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let ticket_label = if state.field == WelcomeField::Ticket { "> Ticket: " } else { "  Ticket: " };
+
+    let ticket_display: String = if state.ticket.len() > 30 {
+        let start = state.ticket_cursor.saturating_sub(15);
+        let end = (start + 30).min(state.ticket.len());
+        let start = end.saturating_sub(30);
+        format!("{}...", &state.ticket[start..end])
+    } else {
+        state.ticket.clone()
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled(ticket_label, ticket_style),
+        Span::styled(
+            &ticket_display,
+            if ticket_active { Style::default().fg(Color::White) } else { Style::default().fg(Color::DarkGray) },
+        ),
+        if state.field == WelcomeField::Ticket && ticket_active {
+            Span::styled("_", Style::default().fg(Color::DarkGray))
+        } else {
+            Span::raw("")
+        },
+    ]));
+    lines.push(Line::from(""));
+
+    // Error or hint line
+    if let Some(err) = &state.error {
+        lines.push(Line::from(Span::styled(
+            format!("  {err}"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  Enter",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" to start  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Tab",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" next field  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Esc",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    let widget = Paragraph::new(lines);
+    f.render_widget(widget, inner);
+
+    // Position cursor in the active text field
+    match state.field {
+        WelcomeField::Name => {
+            f.set_cursor_position((
+                inner.x + 8 + state.name_cursor as u16,
+                inner.y + 2,
+            ));
+        }
+        WelcomeField::Ticket if state.mode == RoomMode::Join => {
+            let display_cursor = if state.ticket.len() > 30 {
+                let start = state.ticket_cursor.saturating_sub(15);
+                (state.ticket_cursor - start).min(30) as u16
+            } else {
+                state.ticket_cursor as u16
+            };
+            f.set_cursor_position((
+                inner.x + 10 + display_cursor,
+                inner.y + 6,
+            ));
+        }
+        _ => {}
+    }
+}
+
+fn handle_welcome_key(state: &mut WelcomeState, key: crossterm::event::KeyEvent) {
+    state.error = None;
+
+    match key.code {
+        KeyCode::Esc => state.should_quit = true,
+        KeyCode::Tab => {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                state.prev_field();
+            } else {
+                state.next_field();
+            }
+        }
+        KeyCode::Down => state.next_field(),
+        KeyCode::Up => state.prev_field(),
+        KeyCode::BackTab => state.prev_field(),
+        KeyCode::Enter => {
+            let name = state.name.trim().to_string();
+            if name.is_empty() {
+                state.error = Some("Name cannot be empty".into());
+                return;
+            }
+            if state.mode == RoomMode::Join && state.ticket.trim().is_empty() {
+                state.error = Some("Ticket is required to join".into());
+                return;
+            }
+            if state.mode == RoomMode::Join {
+                if <ChatTicket as Ticket>::deserialize(state.ticket.trim()).is_err() {
+                    state.error = Some("Invalid ticket format".into());
+                    return;
+                }
+            }
+            // Valid — the main loop will read state and proceed
+        }
+        _ => {
+            // Dispatch to active field
+            match state.field {
+                WelcomeField::Name => handle_text_input(&mut state.name, &mut state.name_cursor, key),
+                WelcomeField::Mode => {
+                    match key.code {
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+                            state.mode = match state.mode {
+                                RoomMode::Create => RoomMode::Join,
+                                RoomMode::Join => RoomMode::Create,
+                            };
+                            // If switching away from Join, move off Ticket field
+                            if state.mode == RoomMode::Create && state.field == WelcomeField::Ticket {
+                                state.field = WelcomeField::Mode;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                WelcomeField::Ticket => {
+                    if state.mode == RoomMode::Join {
+                        handle_text_input(&mut state.ticket, &mut state.ticket_cursor, key);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn handle_text_input(text: &mut String, cursor: &mut usize, key: crossterm::event::KeyEvent) {
+    match key.code {
+        KeyCode::Char(c) => {
+            text.insert(*cursor, c);
+            *cursor += 1;
+        }
+        KeyCode::Backspace => {
+            if *cursor > 0 {
+                *cursor -= 1;
+                text.remove(*cursor);
+            }
+        }
+        KeyCode::Left => {
+            *cursor = cursor.saturating_sub(1);
+        }
+        KeyCode::Right => {
+            if *cursor < text.len() {
+                *cursor += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn run_welcome_screen() -> Result<Option<WelcomeResult>> {
+    enable_raw_mode()?;
+    execute!(std::io::stdout(), EnterAlternateScreen)?;
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(
+        std::io::stdout(),
+    ))?;
+
+    let mut state = WelcomeState::new();
+    let mut events = EventStream::new();
+    let mut tick = interval(Duration::from_millis(50));
+
+    let result = loop {
+        terminal.draw(|f| ui_welcome(f, &state))?;
+
+        tokio::select! {
+            ev = events.next() => {
+                if let Some(Ok(TermEvent::Key(key))) = ev {
+                    if key.kind != KeyEventKind::Press { continue; }
+
+                    handle_welcome_key(&mut state, key);
+
+                    if state.should_quit {
+                        break None;
+                    }
+
+                    // Enter was pressed and validation passed (no error set)
+                    if key.code == KeyCode::Enter && state.error.is_none() {
+                        let nickname = state.name.trim().to_string();
+                        break match state.mode {
+                            RoomMode::Create => Some(WelcomeResult::Create { nickname }),
+                            RoomMode::Join => Some(WelcomeResult::Join {
+                                nickname,
+                                ticket: state.ticket.trim().to_string(),
+                            }),
+                        };
+                    }
+                }
+            }
+            _ = tick.tick() => {}
+        }
+    };
+
+    // Restore terminal before returning
+    disable_raw_mode()?;
+    execute!(std::io::stdout(), LeaveAlternateScreen)?;
+
+    Ok(result)
+}
+
 // ── App state ────────────────────────────────────────────────────────────────
 
 enum ChatLine {
     System(String),
+    Ticket(String),
     Chat { nickname: String, text: String },
 }
 
@@ -168,6 +544,10 @@ impl App {
         self.messages.push(ChatLine::System(msg.into()));
     }
 
+    fn ticket(&mut self, ticket: impl Into<String>) {
+        self.messages.push(ChatLine::Ticket(ticket.into()));
+    }
+
     fn chat(&mut self, nickname: String, text: String) {
         self.messages.push(ChatLine::Chat { nickname, text });
     }
@@ -190,6 +570,18 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
             )),
+            ChatLine::Ticket(ticket) => Line::from(vec![
+                Span::styled(
+                    "Ticket: ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    ticket.as_str(),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
             ChatLine::Chat { nickname, text } => Line::from(vec![
                 Span::styled(
                     nickname.as_str(),
@@ -248,11 +640,23 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let (nickname, ticket) = match &cli {
-        Cli::Create { name } => (name.clone(), ChatTicket::new_random()),
-        Cli::Join { name, ticket } => {
-            let t = <ChatTicket as Ticket>::deserialize(ticket)?;
-            (name.clone(), t)
+    let (nickname, ticket) = match cli.command {
+        Some(Command::Create { name }) => (name, ChatTicket::new_random()),
+        Some(Command::Join { name, ticket }) => {
+            let t = <ChatTicket as Ticket>::deserialize(&ticket)?;
+            (name, t)
+        }
+        None => {
+            match run_welcome_screen().await? {
+                Some(WelcomeResult::Create { nickname }) => {
+                    (nickname, ChatTicket::new_random())
+                }
+                Some(WelcomeResult::Join { nickname, ticket }) => {
+                    let t = <ChatTicket as Ticket>::deserialize(&ticket)?;
+                    (nickname, t)
+                }
+                None => return Ok(()), // User quit
+            }
         }
     };
 
@@ -276,11 +680,6 @@ async fn main() -> Result<()> {
     our_ticket.bootstrap.insert(endpoint.id());
     let ticket_str = <ChatTicket as Ticket>::serialize(&our_ticket);
 
-    // Print ticket before TUI takes over (for copy-paste)
-    println!("Ticket (share with others to join):\n\n{ticket_str}\n");
-    println!("Press ENTER to start chat...");
-    let _ = std::io::stdin().read_line(&mut String::new());
-
     // Subscribe to gossip topic
     let bootstrap: Vec<_> = ticket.bootstrap.iter().cloned().collect();
     let topic = gossip.subscribe(ticket.topic_id, bootstrap).await?;
@@ -300,7 +699,8 @@ async fn main() -> Result<()> {
         name: format!("{nickname} (you)"),
         conn_type: ConnType::Unknown,
     });
-    app.system(format!("ticket: {ticket_str}"));
+    app.ticket(ticket_str);
+    app.system("share the ticket above with others to join");
     app.system("waiting for peers...");
 
     let mut events = EventStream::new();
