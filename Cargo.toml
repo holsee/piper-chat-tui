@@ -8,12 +8,16 @@ license = "MIT OR Apache-2.0"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
+dirs = "6"
 iroh = { version = "0.96", default-features = false }
+iroh-blobs = { version = "0.98", default-features = false, features = ["fs-store"] }
 iroh-gossip = { version = "0.96", default-features = false, features = ["net"] }
 iroh-tickets = "0.3"
+open = "5"
 n0-future = "0.3"
 postcard = { version = "1", features = ["alloc"] }
 rand = "0.9"
 ratatui = "0.29"
+ratatui-explorer = "0.2"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

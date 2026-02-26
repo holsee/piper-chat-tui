@@ -52,6 +52,17 @@ pub enum Message {
     },
     /// A regular chat message from a peer.
     Chat { nickname: String, text: String },
+    /// A file offer — the sender has imported a file into their blob store
+    /// and is advertising it so peers can download via iroh-blobs.
+    FileOffer {
+        nickname: String,
+        endpoint_id: EndpointId,
+        filename: String,
+        size: u64,
+        /// The BLAKE3 hash of the file content, stored as raw bytes for
+        /// compact serialization with postcard.
+        hash: [u8; 32],
+    },
 }
 
 // ── Ticket ───────────────────────────────────────────────────────────────────
@@ -310,6 +321,38 @@ mod tests {
                 assert_eq!(endpoint_id, id);
             }
             _ => panic!("expected Join variant"),
+        }
+    }
+
+    /// Test that `Message::FileOffer` survives a postcard round-trip.
+    #[test]
+    fn message_file_offer_roundtrip() {
+        let id = iroh::EndpointId::from_bytes(&[3u8; 32]).unwrap();
+        let hash = [7u8; 32];
+        let msg = Message::FileOffer {
+            nickname: "Alice".into(),
+            endpoint_id: id,
+            filename: "photo.png".into(),
+            size: 123456,
+            hash,
+        };
+        let bytes = postcard::to_stdvec(&msg).unwrap();
+        let decoded: Message = postcard::from_bytes(&bytes).unwrap();
+        match decoded {
+            Message::FileOffer {
+                nickname,
+                endpoint_id,
+                filename,
+                size,
+                hash: h,
+            } => {
+                assert_eq!(nickname, "Alice");
+                assert_eq!(endpoint_id, id);
+                assert_eq!(filename, "photo.png");
+                assert_eq!(size, 123456);
+                assert_eq!(h, hash);
+            }
+            _ => panic!("expected FileOffer variant"),
         }
     }
 

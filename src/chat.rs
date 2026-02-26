@@ -23,15 +23,25 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-// Import types from our sibling module. `crate::` refers to the crate root
-// (src/main.rs), and `net` is the module declared there with `mod net;`.
-// Rust's module system is explicit — you import exactly what you need.
+// Import types from our sibling modules.
+use crate::filepicker::FilePicker;
 use crate::net::{ConnType, PeerInfo};
+use crate::transfer::{self, TransferManager};
 
 // ── App state ────────────────────────────────────────────────────────────────
 //
 // The `App` struct is the single source of truth for the chat session.
 // It follows the "immediate mode" UI pattern: mutate state → redraw everything.
+
+/// Which UI element currently has keyboard focus.
+pub enum AppMode {
+    /// Normal chat input mode.
+    Chat,
+    /// The modal file picker overlay is open.
+    FilePicker,
+    /// The file share pane has focus (navigate with Up/Down, Enter to act).
+    FilePane,
+}
 
 /// A single line in the chat message log.
 ///
@@ -74,6 +84,12 @@ pub struct App {
     pub should_quit: bool,
     /// Connected peers keyed by their endpoint ID.
     pub peers: BTreeMap<EndpointId, PeerInfo>,
+    /// Which UI element currently has keyboard focus.
+    pub mode: AppMode,
+    /// The modal file picker (present only while the overlay is open).
+    pub file_picker: Option<FilePicker>,
+    /// All file transfer entries (sent and received).
+    pub transfers: TransferManager,
 }
 
 /// The `impl` block contains methods associated with the `App` type.
@@ -95,7 +111,34 @@ impl App {
             cursor_pos: 0,
             should_quit: false,
             peers: BTreeMap::new(),
+            mode: AppMode::Chat,
+            file_picker: None,
+            transfers: TransferManager::new(),
         }
+    }
+
+    /// Open the modal file picker overlay.
+    pub fn open_file_picker(&mut self) {
+        if let Ok(picker) = FilePicker::new() {
+            self.file_picker = Some(picker);
+            self.mode = AppMode::FilePicker;
+        }
+    }
+
+    /// Close the file picker overlay and return to chat mode.
+    pub fn close_file_picker(&mut self) {
+        self.file_picker = None;
+        self.mode = AppMode::Chat;
+    }
+
+    /// Move focus to the file share pane.
+    pub fn focus_file_pane(&mut self) {
+        self.mode = AppMode::FilePane;
+    }
+
+    /// Return focus to chat input.
+    pub fn focus_chat(&mut self) {
+        self.mode = AppMode::Chat;
     }
 
     /// Append a system notification to the message log.
@@ -138,10 +181,19 @@ impl App {
 /// `render_widget()` to place widgets at specific screen rectangles, and
 /// `set_cursor_position()` to show the blinking cursor.
 pub fn ui(f: &mut ratatui::Frame, app: &App) {
-    // Split the terminal into rows: top area (flexible) and bottom input (3 lines).
-    // `Constraint::Min(1)` means "at least 1 row, take all remaining space".
-    // `Constraint::Length(3)` means "exactly 3 rows".
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(f.area());
+    // Build the vertical layout — conditionally include the file pane row when
+    // there are active offers/transfers.
+    let rows = if app.transfers.has_entries() {
+        let file_pane_height = (app.transfers.entries.len() as u16 + 2).min(8);
+        Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(file_pane_height),
+            Constraint::Length(3),
+        ])
+        .split(f.area())
+    } else {
+        Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(f.area())
+    };
     // Split the top row into left (messages, flexible) and right (peers, 24 cols).
     let top = Layout::horizontal([Constraint::Min(1), Constraint::Length(24)]).split(rows[0]);
 
@@ -224,14 +276,38 @@ pub fn ui(f: &mut ratatui::Frame, app: &App) {
 
     // ── Input pane (bottom, full width) ──────────────────────────────────
 
-    let input_widget = Paragraph::new(format!("> {}", app.input))
-        .block(Block::default().borders(Borders::ALL));
-    f.render_widget(input_widget, rows[1]);
+    // The input row index depends on whether the file pane is visible.
+    let input_row = if app.transfers.has_entries() { 2 } else { 1 };
+    let input_border_color = if matches!(app.mode, AppMode::Chat) {
+        Color::Cyan
+    } else {
+        Color::White
+    };
+    let input_widget = Paragraph::new(format!("> {}", app.input)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(input_border_color)),
+    );
+    f.render_widget(input_widget, rows[input_row]);
 
     // Place the terminal cursor at the user's typing position.
-    // `+2` accounts for the border (1) and the "> " prompt (1).
-    // `as u16` is a safe cast — cursor_pos is always small enough for u16.
-    f.set_cursor_position((rows[1].x + 2 + app.cursor_pos as u16, rows[1].y + 1));
+    f.set_cursor_position((
+        rows[input_row].x + 2 + app.cursor_pos as u16,
+        rows[input_row].y + 1,
+    ));
+
+    // ── File share pane (between messages and input) ─────────────────
+
+    if app.transfers.has_entries() {
+        let focused = matches!(app.mode, AppMode::FilePane);
+        transfer::render_file_pane(f, rows[1], &app.transfers, focused);
+    }
+
+    // ── File picker overlay (on top of everything) ───────────────────
+
+    if let Some(picker) = &app.file_picker {
+        picker.render(f);
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
