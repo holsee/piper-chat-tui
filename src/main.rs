@@ -1,33 +1,84 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, RwLock};
+//! piper-chat — P2P terminal chat over iroh gossip.
+//!
+//! This is the crate root. It declares the module tree, defines the CLI, and
+//! runs the main event loop that ties networking, input, and rendering together.
+//!
+//! ## Module structure
+//!
+//! - `net`     — Wire protocol, tickets, and connection tracking
+//! - `welcome` — Interactive welcome screen (room setup form)
+//! - `chat`    — Chat UI state (`App`) and rendering (`ui()`)
 
+// ── Module declarations ─────────────────────────────────────────────────────
+//
+// `mod name;` tells the compiler to look for `src/name.rs` (or `src/name/mod.rs`)
+// and include it as a child module. This is Rust's explicit module system —
+// files aren't automatically part of the crate; you must declare them.
+//
+// Modules form a tree rooted at `main.rs` (for binaries) or `lib.rs` (for
+// libraries). Items are private by default; `pub` makes them visible to the
+// parent module and beyond.
+mod chat;
+mod net;
+mod welcome;
+
+// ── Imports ─────────────────────────────────────────────────────────────────
+//
+// `use` brings items into scope so we can refer to them by short name.
+// Items from external crates (declared in Cargo.toml) are imported by
+// crate name. Items from our own modules use `crate::module::item` or,
+// since main.rs is the crate root, just `module::item`.
+
+// `anyhow::Result` is `Result<T, anyhow::Error>` — a catch-all error type
+// that can hold any error. Great for applications (as opposed to libraries,
+// which typically define specific error types).
 use anyhow::Result;
+// `clap::Parser` is a derive macro that generates a CLI argument parser from
+// struct/enum definitions. `#[derive(Parser)]` on a struct auto-implements
+// the `Parser` trait, giving it a `.parse()` class method.
 use clap::Parser;
 use crossterm::{
-    event::{Event as TermEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers},
+    // Crossterm events for keyboard input. `EventStream` provides an async
+    // stream of terminal events (keys, mouse, resize). We rename `Event` to
+    // `TermEvent` to avoid name collision with gossip events.
+    event::{Event as TermEvent, EventStream, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use iroh::endpoint::{AfterHandshakeOutcome, ConnectionInfo, EndpointHooks};
-use iroh::EndpointId;
 use iroh_gossip::{
+    // `GossipEvent` variants tell us about network activity: messages received,
+    // peers joining/leaving, stream lag, etc.
     api::Event as GossipEvent,
+    // `Gossip` is the gossip protocol handle; `GOSSIP_ALPN` is the QUIC
+    // Application-Layer Protocol Negotiation string that identifies gossip
+    // connections during the TLS handshake.
     net::{Gossip, GOSSIP_ALPN},
-    proto::TopicId,
 };
+// The `Ticket` trait provides `serialize()` / `deserialize()` for base32
+// encoding. We import the trait to call these methods on `ChatTicket`.
 use iroh_tickets::Ticket;
+// `StreamExt` adds `.next()` and `.try_next()` to async streams. Without
+// this import, `.try_next()` on the gossip receiver wouldn't compile —
+// Rust requires extension traits to be in scope to use their methods.
 use n0_future::StreamExt;
-use ratatui::{
-    layout::{Alignment, Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
-};
-use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, interval};
 
-// ── CLI ──────────────────────────────────────────────────────────────────────
+// Imports from our own modules. These types are `pub` in their respective
+// modules; main.rs consumes them to wire everything together.
+use chat::{ui, App};
+use net::{ChatTicket, ConnTracker, ConnType, Message, PeerInfo};
+use welcome::{run_welcome_screen, WelcomeResult};
 
+// ── CLI ──────────────────────────────────────────────────────────────────────
+//
+// Clap's derive API turns Rust structs into full-featured CLI parsers.
+// `#[derive(Parser)]` generates the argument parsing code at compile time.
+
+/// Top-level CLI structure.
+///
+/// `#[command(...)]` attributes configure the help text and binary name.
+/// `Option<Command>` makes the subcommand optional — when omitted, we launch
+/// the interactive welcome screen instead.
 #[derive(Parser)]
 #[command(name = "piper-chat", about = "P2P terminal chat over iroh gossip")]
 struct Cli {
@@ -35,6 +86,11 @@ struct Cli {
     command: Option<Command>,
 }
 
+/// Subcommands for creating or joining a room from the command line.
+///
+/// `#[derive(clap::Subcommand)]` generates `create` and `join` subcommands.
+/// Doc comments (`///`) become the help text shown by `--help`.
+/// `#[arg(short, long)]` makes `-n` and `--name` both work.
 #[derive(clap::Subcommand)]
 enum Command {
     /// Create a new chat room
@@ -53,599 +109,37 @@ enum Command {
     },
 }
 
-// ── Wire protocol ────────────────────────────────────────────────────────────
-
-#[derive(Serialize, Deserialize)]
-enum Message {
-    Join {
-        nickname: String,
-        endpoint_id: EndpointId,
-    },
-    Chat {
-        nickname: String,
-        text: String,
-    },
-}
-
-// ── Ticket ───────────────────────────────────────────────────────────────────
-
-#[derive(Serialize, Deserialize, Clone)]
-struct ChatTicket {
-    topic_id: TopicId,
-    bootstrap: BTreeSet<EndpointId>,
-}
-
-impl ChatTicket {
-    fn new_random() -> Self {
-        Self {
-            topic_id: TopicId::from_bytes(rand::random()),
-            bootstrap: BTreeSet::new(),
-        }
-    }
-}
-
-impl Ticket for ChatTicket {
-    const KIND: &'static str = "chat";
-
-    fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_stdvec(self).unwrap()
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Result<Self, iroh_tickets::ParseError> {
-        Ok(postcard::from_bytes(bytes)?)
-    }
-}
-
-// ── Connection tracking ─────────────────────────────────────────────────
-
-enum ConnType {
-    Unknown,
-    Direct,
-    Relay,
-}
-
-struct PeerInfo {
-    name: String,
-    conn_type: ConnType,
-}
-
-#[derive(Debug)]
-struct ConnTracker(Arc<RwLock<HashMap<EndpointId, ConnectionInfo>>>);
-
-impl ConnTracker {
-    fn new() -> Self {
-        Self(Arc::default())
-    }
-
-    fn hook(&self) -> ConnTrackerHook {
-        ConnTrackerHook(self.0.clone())
-    }
-
-    fn conn_type(&self, id: &EndpointId) -> ConnType {
-        let map = self.0.read().unwrap();
-        match map.get(id).and_then(|c| c.selected_path()) {
-            Some(p) if p.is_ip() => ConnType::Direct,
-            Some(_) => ConnType::Relay,
-            None => ConnType::Unknown,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ConnTrackerHook(Arc<RwLock<HashMap<EndpointId, ConnectionInfo>>>);
-
-impl EndpointHooks for ConnTrackerHook {
-    fn after_handshake<'a>(
-        &'a self,
-        conn: &'a ConnectionInfo,
-    ) -> impl std::future::Future<Output = AfterHandshakeOutcome> + Send + 'a {
-        self.0.write().unwrap().insert(conn.remote_id(), conn.clone());
-        async { AfterHandshakeOutcome::accept() }
-    }
-}
-
-// ── Welcome screen ──────────────────────────────────────────────────────────
-
-#[derive(PartialEq)]
-enum WelcomeField {
-    Name,
-    Mode,
-    Ticket,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum RoomMode {
-    Create,
-    Join,
-}
-
-struct WelcomeState {
-    field: WelcomeField,
-    name: String,
-    name_cursor: usize,
-    mode: RoomMode,
-    ticket: String,
-    ticket_cursor: usize,
-    error: Option<String>,
-    should_quit: bool,
-}
-
-impl WelcomeState {
-    fn new() -> Self {
-        Self {
-            field: WelcomeField::Name,
-            name: String::new(),
-            name_cursor: 0,
-            mode: RoomMode::Create,
-            ticket: String::new(),
-            ticket_cursor: 0,
-            error: None,
-            should_quit: false,
-        }
-    }
-
-    fn next_field(&mut self) {
-        self.field = match self.field {
-            WelcomeField::Name => WelcomeField::Mode,
-            WelcomeField::Mode => {
-                if self.mode == RoomMode::Join {
-                    WelcomeField::Ticket
-                } else {
-                    WelcomeField::Name
-                }
-            }
-            WelcomeField::Ticket => WelcomeField::Name,
-        };
-    }
-
-    fn prev_field(&mut self) {
-        self.field = match self.field {
-            WelcomeField::Name => {
-                if self.mode == RoomMode::Join {
-                    WelcomeField::Ticket
-                } else {
-                    WelcomeField::Mode
-                }
-            }
-            WelcomeField::Mode => WelcomeField::Name,
-            WelcomeField::Ticket => WelcomeField::Mode,
-        };
-    }
-}
-
-enum WelcomeResult {
-    Create { nickname: String },
-    Join { nickname: String, ticket: String },
-}
-
-fn ui_welcome(f: &mut ratatui::Frame, state: &WelcomeState) {
-    let area = f.area();
-
-    // Centered card: 50 wide, 14 tall
-    let card_w: u16 = 52;
-    let card_h: u16 = 14;
-    let x = area.width.saturating_sub(card_w) / 2;
-    let y = area.height.saturating_sub(card_h) / 2;
-    let card = Rect::new(x, y, card_w.min(area.width), card_h.min(area.height));
-
-    // Clear background and draw border
-    f.render_widget(Clear, card);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" piper-chat ")
-        .title_alignment(Alignment::Center);
-    f.render_widget(block, card);
-
-    let inner = Rect::new(card.x + 2, card.y + 1, card.width.saturating_sub(4), card.height.saturating_sub(2));
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Subtitle
-    lines.push(Line::from(Span::styled(
-        "P2P terminal chat over iroh gossip",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-    )));
-    lines.push(Line::from(""));
-
-    // Name field
-    let name_style = if state.field == WelcomeField::Name {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::White)
-    };
-    let name_label = if state.field == WelcomeField::Name { "> Name: " } else { "  Name: " };
-    lines.push(Line::from(vec![
-        Span::styled(name_label, name_style),
-        Span::styled(&state.name, Style::default().fg(Color::White)),
-        if state.field == WelcomeField::Name {
-            Span::styled("_", Style::default().fg(Color::DarkGray))
-        } else {
-            Span::raw("")
-        },
-    ]));
-    lines.push(Line::from(""));
-
-    // Mode field
-    let mode_style = if state.field == WelcomeField::Mode {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::White)
-    };
-    let mode_label = if state.field == WelcomeField::Mode { "> Mode: " } else { "  Mode: " };
-    let (create_style, join_style) = match state.mode {
-        RoomMode::Create => (
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::DarkGray),
-        ),
-        RoomMode::Join => (
-            Style::default().fg(Color::DarkGray),
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ),
-    };
-    lines.push(Line::from(vec![
-        Span::styled(mode_label, mode_style),
-        Span::styled(" Create ", create_style),
-        Span::raw("  "),
-        Span::styled(" Join ", join_style),
-    ]));
-    lines.push(Line::from(""));
-
-    // Ticket field
-    let ticket_active = state.mode == RoomMode::Join;
-    let ticket_style = if !ticket_active {
-        Style::default().fg(Color::DarkGray)
-    } else if state.field == WelcomeField::Ticket {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::White)
-    };
-    let ticket_label = if state.field == WelcomeField::Ticket { "> Ticket: " } else { "  Ticket: " };
-
-    let ticket_display: String = if state.ticket.len() > 30 {
-        let start = state.ticket_cursor.saturating_sub(15);
-        let end = (start + 30).min(state.ticket.len());
-        let start = end.saturating_sub(30);
-        format!("{}...", &state.ticket[start..end])
-    } else {
-        state.ticket.clone()
-    };
-
-    lines.push(Line::from(vec![
-        Span::styled(ticket_label, ticket_style),
-        Span::styled(
-            &ticket_display,
-            if ticket_active { Style::default().fg(Color::White) } else { Style::default().fg(Color::DarkGray) },
-        ),
-        if state.field == WelcomeField::Ticket && ticket_active {
-            Span::styled("_", Style::default().fg(Color::DarkGray))
-        } else {
-            Span::raw("")
-        },
-    ]));
-    lines.push(Line::from(""));
-
-    // Error or hint line
-    if let Some(err) = &state.error {
-        lines.push(Line::from(Span::styled(
-            format!("  {err}"),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "  Enter",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" to start  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "Tab",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" next field  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "Esc",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" quit", Style::default().fg(Color::DarkGray)),
-        ]));
-    }
-
-    let widget = Paragraph::new(lines);
-    f.render_widget(widget, inner);
-
-    // Position cursor in the active text field
-    match state.field {
-        WelcomeField::Name => {
-            f.set_cursor_position((
-                inner.x + 8 + state.name_cursor as u16,
-                inner.y + 2,
-            ));
-        }
-        WelcomeField::Ticket if state.mode == RoomMode::Join => {
-            let display_cursor = if state.ticket.len() > 30 {
-                let start = state.ticket_cursor.saturating_sub(15);
-                (state.ticket_cursor - start).min(30) as u16
-            } else {
-                state.ticket_cursor as u16
-            };
-            f.set_cursor_position((
-                inner.x + 10 + display_cursor,
-                inner.y + 6,
-            ));
-        }
-        _ => {}
-    }
-}
-
-fn handle_welcome_key(state: &mut WelcomeState, key: crossterm::event::KeyEvent) {
-    state.error = None;
-
-    match key.code {
-        KeyCode::Esc => state.should_quit = true,
-        KeyCode::Tab => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                state.prev_field();
-            } else {
-                state.next_field();
-            }
-        }
-        KeyCode::Down => state.next_field(),
-        KeyCode::Up => state.prev_field(),
-        KeyCode::BackTab => state.prev_field(),
-        KeyCode::Enter => {
-            let name = state.name.trim().to_string();
-            if name.is_empty() {
-                state.error = Some("Name cannot be empty".into());
-                return;
-            }
-            if state.mode == RoomMode::Join && state.ticket.trim().is_empty() {
-                state.error = Some("Ticket is required to join".into());
-                return;
-            }
-            if state.mode == RoomMode::Join {
-                if <ChatTicket as Ticket>::deserialize(state.ticket.trim()).is_err() {
-                    state.error = Some("Invalid ticket format".into());
-                    return;
-                }
-            }
-            // Valid — the main loop will read state and proceed
-        }
-        _ => {
-            // Dispatch to active field
-            match state.field {
-                WelcomeField::Name => handle_text_input(&mut state.name, &mut state.name_cursor, key),
-                WelcomeField::Mode => {
-                    match key.code {
-                        KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
-                            state.mode = match state.mode {
-                                RoomMode::Create => RoomMode::Join,
-                                RoomMode::Join => RoomMode::Create,
-                            };
-                            // If switching away from Join, move off Ticket field
-                            if state.mode == RoomMode::Create && state.field == WelcomeField::Ticket {
-                                state.field = WelcomeField::Mode;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                WelcomeField::Ticket => {
-                    if state.mode == RoomMode::Join {
-                        handle_text_input(&mut state.ticket, &mut state.ticket_cursor, key);
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn handle_text_input(text: &mut String, cursor: &mut usize, key: crossterm::event::KeyEvent) {
-    match key.code {
-        KeyCode::Char(c) => {
-            text.insert(*cursor, c);
-            *cursor += 1;
-        }
-        KeyCode::Backspace => {
-            if *cursor > 0 {
-                *cursor -= 1;
-                text.remove(*cursor);
-            }
-        }
-        KeyCode::Left => {
-            *cursor = cursor.saturating_sub(1);
-        }
-        KeyCode::Right => {
-            if *cursor < text.len() {
-                *cursor += 1;
-            }
-        }
-        _ => {}
-    }
-}
-
-async fn run_welcome_screen() -> Result<Option<WelcomeResult>> {
-    enable_raw_mode()?;
-    execute!(std::io::stdout(), EnterAlternateScreen)?;
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(
-        std::io::stdout(),
-    ))?;
-
-    let mut state = WelcomeState::new();
-    let mut events = EventStream::new();
-    let mut tick = interval(Duration::from_millis(50));
-
-    let result = loop {
-        terminal.draw(|f| ui_welcome(f, &state))?;
-
-        tokio::select! {
-            ev = events.next() => {
-                if let Some(Ok(TermEvent::Key(key))) = ev {
-                    if key.kind != KeyEventKind::Press { continue; }
-
-                    handle_welcome_key(&mut state, key);
-
-                    if state.should_quit {
-                        break None;
-                    }
-
-                    // Enter was pressed and validation passed (no error set)
-                    if key.code == KeyCode::Enter && state.error.is_none() {
-                        let nickname = state.name.trim().to_string();
-                        break match state.mode {
-                            RoomMode::Create => Some(WelcomeResult::Create { nickname }),
-                            RoomMode::Join => Some(WelcomeResult::Join {
-                                nickname,
-                                ticket: state.ticket.trim().to_string(),
-                            }),
-                        };
-                    }
-                }
-            }
-            _ = tick.tick() => {}
-        }
-    };
-
-    // Restore terminal before returning
-    disable_raw_mode()?;
-    execute!(std::io::stdout(), LeaveAlternateScreen)?;
-
-    Ok(result)
-}
-
-// ── App state ────────────────────────────────────────────────────────────────
-
-enum ChatLine {
-    System(String),
-    Ticket(String),
-    Chat { nickname: String, text: String },
-}
-
-struct App {
-    messages: Vec<ChatLine>,
-    input: String,
-    cursor_pos: usize,
-    should_quit: bool,
-    peers: BTreeMap<EndpointId, PeerInfo>,
-}
-
-impl App {
-    fn new() -> Self {
-        Self {
-            messages: Vec::new(),
-            input: String::new(),
-            cursor_pos: 0,
-            should_quit: false,
-            peers: BTreeMap::new(),
-        }
-    }
-
-    fn system(&mut self, msg: impl Into<String>) {
-        self.messages.push(ChatLine::System(msg.into()));
-    }
-
-    fn ticket(&mut self, ticket: impl Into<String>) {
-        self.messages.push(ChatLine::Ticket(ticket.into()));
-    }
-
-    fn chat(&mut self, nickname: String, text: String) {
-        self.messages.push(ChatLine::Chat { nickname, text });
-    }
-}
-
-// ── UI ───────────────────────────────────────────────────────────────────────
-
-fn ui(f: &mut ratatui::Frame, app: &App) {
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(f.area());
-    let top = Layout::horizontal([Constraint::Min(1), Constraint::Length(24)]).split(rows[0]);
-
-    // Messages pane (top left)
-    let lines: Vec<Line> = app
-        .messages
-        .iter()
-        .map(|msg| match msg {
-            ChatLine::System(text) => Line::from(Span::styled(
-                format!("[system] {text}"),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            )),
-            ChatLine::Ticket(ticket) => Line::from(vec![
-                Span::styled(
-                    "Ticket: ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    ticket.as_str(),
-                    Style::default().fg(Color::White),
-                ),
-            ]),
-            ChatLine::Chat { nickname, text } => Line::from(vec![
-                Span::styled(
-                    nickname.as_str(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!(": {text}")),
-            ]),
-        })
-        .collect();
-
-    let visible = top[0].height.saturating_sub(2) as usize;
-    let scroll = lines.len().saturating_sub(visible) as u16;
-
-    let messages_widget = Paragraph::new(lines)
-        .scroll((scroll, 0))
-        .block(Block::default().borders(Borders::ALL).title("piper-chat"));
-    f.render_widget(messages_widget, top[0]);
-
-    // Peers pane (top right)
-    let peer_lines: Vec<Line> = app
-        .peers
-        .values()
-        .map(|peer| {
-            let (tag, tag_color) = match peer.conn_type {
-                ConnType::Direct => ("[direct]", Color::Green),
-                ConnType::Relay => ("[relay]", Color::Yellow),
-                ConnType::Unknown => ("[?]", Color::DarkGray),
-            };
-            Line::from(vec![
-                Span::styled(format!("{tag} "), Style::default().fg(tag_color)),
-                Span::styled(peer.name.as_str(), Style::default().fg(Color::Green)),
-            ])
-        })
-        .collect();
-    let peers_widget = Paragraph::new(peer_lines)
-        .block(Block::default().borders(Borders::ALL).title("peers"));
-    f.render_widget(peers_widget, top[1]);
-
-    // Input pane (full width)
-    let input_widget = Paragraph::new(format!("> {}", app.input))
-        .block(Block::default().borders(Borders::ALL));
-    f.render_widget(input_widget, rows[1]);
-
-    // Cursor position
-    f.set_cursor_position((
-        rows[1].x + 2 + app.cursor_pos as u16,
-        rows[1].y + 1,
-    ));
-}
-
 // ── Main ─────────────────────────────────────────────────────────────────────
 
+/// Entry point. `#[tokio::main]` is a macro that sets up the tokio async
+/// runtime and wraps `main()` in a `block_on()` call. Without it, `async fn
+/// main()` wouldn't work — Rust has no built-in async runtime; you must pick
+/// one (tokio, async-std, smol, etc.).
+///
+/// `-> Result<()>` means main can return errors. If `main` returns `Err(e)`,
+/// the process exits with a non-zero code and prints the error. The `?`
+/// operator throughout propagates errors to this return type.
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Parse CLI arguments. `Cli::parse()` reads `std::env::args()`, validates
+    // them against our struct definition, and returns a populated `Cli` or
+    // exits with a help/error message.
     let cli = Cli::parse();
 
+    // Determine nickname and ticket from either CLI args or the welcome screen.
+    //
+    // This `match` demonstrates *destructuring*: `Some(Command::Create { name })`
+    // reaches into nested enums/structs and binds inner fields to local variables
+    // in one expression. Rust's pattern matching is one of its most powerful features.
     let (nickname, ticket) = match cli.command {
         Some(Command::Create { name }) => (name, ChatTicket::new_random()),
         Some(Command::Join { name, ticket }) => {
+            // Fully-qualified syntax to call the `Ticket` trait's `deserialize` method.
+            // `?` propagates the error if the ticket string is invalid.
             let t = <ChatTicket as Ticket>::deserialize(&ticket)?;
             (name, t)
         }
+        // `None` means no subcommand was given — launch the interactive welcome screen.
         None => {
             match run_welcome_screen().await? {
                 Some(WelcomeResult::Create { nickname }) => {
@@ -655,38 +149,58 @@ async fn main() -> Result<()> {
                     let t = <ChatTicket as Ticket>::deserialize(&ticket)?;
                     (nickname, t)
                 }
-                None => return Ok(()), // User quit
+                None => return Ok(()), // User pressed Esc to quit
             }
         }
     };
 
     // ── Networking ───────────────────────────────────────────────────────────
+    //
+    // Set up the iroh networking stack: endpoint → gossip → router.
+    // This follows the iroh "protocol stack" pattern where each layer wraps
+    // the one below.
 
+    // `ConnTracker` records connection metadata (direct vs relayed) for each peer.
     let conn_tracker = ConnTracker::new();
+
+    // Build an iroh `Endpoint` — this is the QUIC transport layer.
+    // `.alpns()` registers which protocols this endpoint speaks.
+    // `.hooks()` installs our connection tracker to intercept handshakes.
+    // `.bind()` is async — it opens the UDP socket and starts listening.
+    // `.await?` suspends until binding completes, propagating errors with `?`.
     let endpoint = iroh::Endpoint::builder()
         .alpns(vec![GOSSIP_ALPN.to_vec()])
         .hooks(conn_tracker.hook())
         .bind()
         .await?;
 
+    // Create the gossip protocol layer on top of the endpoint.
+    // `.spawn()` starts a background task that manages gossip state.
     let gossip = Gossip::builder().spawn(endpoint.clone());
 
+    // The router dispatches incoming connections to the right protocol handler
+    // based on the ALPN negotiated during the TLS handshake.
     let router = iroh::protocol::Router::builder(endpoint.clone())
         .accept(GOSSIP_ALPN, gossip.clone())
         .spawn();
 
-    // Build shareable ticket (includes our endpoint as bootstrap)
+    // Build a shareable ticket that includes our own endpoint ID so others
+    // can connect to us. `mut` allows us to modify the cloned ticket.
     let mut our_ticket = ticket.clone();
     our_ticket.bootstrap.insert(endpoint.id());
     let ticket_str = <ChatTicket as Ticket>::serialize(&our_ticket);
 
-    // Subscribe to gossip topic
+    // Subscribe to the gossip topic (chat room). `bootstrap` is the list of
+    // known peers to connect to initially. `.split()` gives us separate
+    // sender and receiver handles — a common pattern for duplex channels.
     let bootstrap: Vec<_> = ticket.bootstrap.iter().cloned().collect();
     let topic = gossip.subscribe(ticket.topic_id, bootstrap).await?;
     let (sender, mut receiver) = topic.split();
 
     // ── Terminal setup ───────────────────────────────────────────────────────
 
+    // Enable raw mode (no line buffering, no echo) and switch to the alternate
+    // screen buffer so the chat UI doesn't clobber the user's scrollback.
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen)?;
     let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(
@@ -695,29 +209,53 @@ async fn main() -> Result<()> {
 
     let our_id = endpoint.id();
     let mut app = App::new();
-    app.peers.insert(our_id, PeerInfo {
-        name: format!("{nickname} (you)"),
-        conn_type: ConnType::Unknown,
-    });
+    // Insert ourselves in the peers list so we appear in the sidebar.
+    app.peers.insert(
+        our_id,
+        PeerInfo {
+            name: format!("{nickname} (you)"),
+            conn_type: ConnType::Unknown,
+        },
+    );
     app.ticket(ticket_str);
     app.system("share the ticket above with others to join");
     app.system("waiting for peers...");
 
+    // `EventStream` wraps crossterm's synchronous event polling into an async stream.
     let mut events = EventStream::new();
+    // A 50ms tick interval drives UI redraws — even when no input arrives,
+    // we still update the display (e.g. connection type changes from the tracker).
     let mut tick = interval(Duration::from_millis(50));
 
     // ── Event loop ───────────────────────────────────────────────────────────
+    //
+    // This is the heart of the application. `tokio::select!` multiplexes three
+    // async event sources into a single loop:
+    // 1. Terminal keyboard events (user input)
+    // 2. Gossip network events (messages, peer joins/leaves)
+    // 3. Timer ticks (UI refresh + connection status polling)
+    //
+    // Only one branch runs per iteration — whichever future resolves first.
 
     loop {
+        // Redraw the entire UI from current state. This is ratatui's
+        // "immediate mode" model — no retained widget tree, just rebuild
+        // every frame. The closure borrows `app` immutably for rendering.
         terminal.draw(|f| ui(f, &app))?;
 
         tokio::select! {
+            // ── Branch 1: Keyboard input ─────────────────────────────────
             ev = events.next() => {
                 if let Some(Ok(TermEvent::Key(key))) = ev {
+                    // Filter out release/repeat events (Windows sends both)
                     if key.kind != KeyEventKind::Press { continue; }
                     match key.code {
                         KeyCode::Esc => app.should_quit = true,
                         KeyCode::Enter => {
+                            // `.drain(..)` empties the string and returns its
+                            // contents as an iterator. `.collect()` gathers them
+                            // back into a new String. This transfers ownership of
+                            // the character data without reallocating.
                             let text: String = app.input.drain(..).collect();
                             app.cursor_pos = 0;
                             if !text.is_empty() {
@@ -725,8 +263,12 @@ async fn main() -> Result<()> {
                                     nickname: nickname.clone(),
                                     text: text.clone(),
                                 };
+                                // Serialize the message with postcard and broadcast
+                                // to all peers on the gossip topic.
+                                // `.into()` converts `Vec<u8>` to `Bytes` (zero-copy).
                                 let encoded = postcard::to_stdvec(&msg)?;
                                 sender.broadcast(encoded.into()).await?;
+                                // Also display locally (gossip doesn't echo back)
                                 app.chat(nickname.clone(), text);
                             }
                         }
@@ -753,9 +295,18 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // ── Branch 2: Gossip network events ──────────────────────────
+            //
+            // `.try_next()` returns `Result<Option<Event>>`:
+            // - `Ok(Some(event))` — received an event
+            // - `Ok(None)`        — stream closed (no more events)
+            // - `Err(e)`          — stream error
             msg = receiver.try_next() => {
                 match msg {
                     Ok(Some(GossipEvent::Received(msg))) => {
+                        // Deserialize the incoming message. `postcard::from_bytes`
+                        // returns our `Message` enum — the variant tag is encoded
+                        // in the first byte(s).
                         match postcard::from_bytes(&msg.content) {
                             Ok(Message::Join { nickname: name, endpoint_id }) => {
                                 app.system(format!("{name} joined"));
@@ -767,16 +318,19 @@ async fn main() -> Result<()> {
                             Ok(Message::Chat { nickname, text }) => {
                                 app.chat(nickname, text);
                             }
+                            // Silently ignore malformed messages
                             Err(_) => {}
                         }
                     }
+                    // A new peer connected to the gossip topic
                     Ok(Some(GossipEvent::NeighborUp(id))) => {
                         app.peers.insert(id, PeerInfo {
                             name: id.fmt_short().to_string(),
                             conn_type: ConnType::Unknown,
                         });
                         app.system(format!("peer connected: {}", id.fmt_short()));
-                        // Announce ourselves so the new peer learns our name
+                        // Announce ourselves so the new peer learns our display name.
+                        // Without this, they'd only see our short endpoint ID.
                         let join = Message::Join {
                             nickname: nickname.clone(),
                             endpoint_id: our_id,
@@ -784,8 +338,15 @@ async fn main() -> Result<()> {
                         let encoded = postcard::to_stdvec(&join)?;
                         sender.broadcast(encoded.into()).await?;
                     }
+                    // A peer disconnected from the gossip topic
                     Ok(Some(GossipEvent::NeighborDown(id))) => {
-                        let name = app.peers.remove(&id).map(|p| p.name).unwrap_or_else(|| id.fmt_short().to_string());
+                        // `.remove()` returns `Option<V>` — we use it to get the
+                        // peer's display name for the departure message.
+                        // `.unwrap_or_else()` provides a fallback closure that's
+                        // only called if the Option is None.
+                        let name = app.peers.remove(&id)
+                            .map(|p| p.name)
+                            .unwrap_or_else(|| id.fmt_short().to_string());
                         app.system(format!("{name} left"));
                     }
                     Ok(Some(GossipEvent::Lagged)) => {
@@ -801,8 +362,14 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // ── Branch 3: UI tick (50ms) ─────────────────────────────────
+            //
+            // On each tick, poll the connection tracker to update peer connection
+            // types (direct vs relayed). This catches changes that happen
+            // asynchronously as QUIC path probing discovers direct routes.
             _ = tick.tick() => {
                 for (id, peer) in &mut app.peers {
+                    // Don't look up our own connection type (we're always local)
                     if *id != our_id {
                         peer.conn_type = conn_tracker.conn_type(id);
                     }
@@ -816,12 +383,17 @@ async fn main() -> Result<()> {
     }
 
     // ── Restore terminal ─────────────────────────────────────────────────────
-
+    //
+    // Disable raw mode and leave the alternate screen so the user's original
+    // terminal contents reappear. This must happen before process exit.
     disable_raw_mode()?;
     execute!(std::io::stdout(), LeaveAlternateScreen)?;
 
     // ── Shutdown ─────────────────────────────────────────────────────────────
-
+    //
+    // Gracefully shut down the networking stack. `router.shutdown()` stops
+    // accepting new connections; `endpoint.close()` closes the QUIC socket.
+    // Both are async and may take a moment to drain in-flight data.
     router.shutdown().await?;
     endpoint.close().await;
 
