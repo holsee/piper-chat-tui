@@ -29,7 +29,7 @@ use crossterm::event::Event;
 //   Used for overlays to prevent the underlying UI from showing through.
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Color, Style},
+    style::Style,
     widgets::{Block, Borders, Clear},
 };
 // `ratatui_explorer` provides a ready-made filesystem browser widget:
@@ -39,9 +39,10 @@ use ratatui::{
 // - `Theme`: builder API for customizing the explorer's appearance (border style,
 //   highlight colors, etc.). Uses the builder pattern: chain `.with_*()` methods
 //   to configure, then pass to `FileExplorer::with_theme()`.
-use ratatui_explorer::{FileExplorer, Theme};
-// `PathBuf` — owned filesystem path, returned when the user selects a file.
+use ratatui_explorer::{FileExplorer, Theme as ExplorerTheme};
 use std::path::PathBuf;
+
+use crate::theme::Theme;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -77,35 +78,30 @@ impl FilePicker {
     /// `Result<Self>` because `FileExplorer::with_theme()` can fail if the
     /// current directory is unreadable. The `?` operator propagates any error
     /// to the caller, which displays it as a system message.
-    pub fn new() -> Result<Self> {
-        // `Theme::default()` creates a theme with sensible defaults, then we
-        // customize it with the builder pattern — each `.with_*()` method
-        // returns `Self` so calls can be chained fluently.
-        let theme = Theme::default()
+    pub fn new(theme: &Theme) -> Result<Self> {
+        let explorer_theme = ExplorerTheme::default()
             .with_block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
+                    .style(Style::default().bg(theme.bg))
+                    .border_style(Style::default().fg(theme.border_focused))
                     .title(" Select File (Enter=select, Esc=cancel) ")
-                    .title_alignment(Alignment::Center),
+                    .title_alignment(Alignment::Center)
+                    .title_style(Style::default().fg(theme.title)),
             )
-            // Highlight style for regular files when selected.
             .with_highlight_item_style(
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan),
+                    .fg(theme.picker_highlight_file_fg)
+                    .bg(theme.picker_highlight_file_bg),
             )
-            // Highlight style for directories when selected — yellow to
-            // distinguish from files at a glance.
             .with_highlight_dir_style(
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow),
+                    .fg(theme.picker_highlight_dir_fg)
+                    .bg(theme.picker_highlight_dir_bg),
             )
-            // Adds the current directory path as the block title.
             .add_default_title();
 
-        let explorer = FileExplorer::with_theme(theme)?;
+        let explorer = FileExplorer::with_theme(explorer_theme)?;
         Ok(Self { explorer })
     }
 

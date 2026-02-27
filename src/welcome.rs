@@ -29,15 +29,14 @@ use iroh_tickets::Ticket;
 use n0_future::StreamExt;
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
 use tokio::time::{Duration, interval};
 
-// `crate::net` refers to the `net` module declared at the crate root.
-// We only need `ChatTicket` for ticket validation in the join flow.
 use crate::net::ChatTicket;
+use crate::theme::Theme;
 
 // ── Welcome screen state ────────────────────────────────────────────────────
 //
@@ -162,26 +161,27 @@ pub enum WelcomeResult {
 ///
 /// `&WelcomeState` is an immutable borrow. The function can read all fields
 /// but cannot modify any of them. This is enforced at compile time.
-fn ui_welcome(f: &mut ratatui::Frame, state: &WelcomeState) {
+fn ui_welcome(f: &mut ratatui::Frame, state: &WelcomeState, theme: &Theme) {
     let area = f.area();
 
-    // Centered card: 52 wide, 14 tall
+    // Paint the full-screen background so the theme bg covers the terminal area.
+    let bg_block = Block::default().style(Style::default().bg(theme.bg));
+    f.render_widget(bg_block, area);
+
     let card_w: u16 = 52;
     let card_h: u16 = 14;
-    // `saturating_sub` prevents underflow — returns 0 if the subtraction
-    // would go negative. This is safer than `wrapping_sub` (which wraps to
-    // u16::MAX) or plain `-` (which panics in debug mode on underflow).
     let x = area.width.saturating_sub(card_w) / 2;
     let y = area.height.saturating_sub(card_h) / 2;
     let card = Rect::new(x, y, card_w.min(area.width), card_h.min(area.height));
 
-    // `Clear` erases the card area so we get a clean background
     f.render_widget(Clear, card);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(theme.bg))
+        .border_style(Style::default().fg(theme.border_focused))
         .title(" piper-chat ")
-        .title_alignment(Alignment::Center);
+        .title_alignment(Alignment::Center)
+        .title_style(Style::default().fg(theme.title));
     f.render_widget(block, card);
 
     let inner = Rect::new(
@@ -191,41 +191,36 @@ fn ui_welcome(f: &mut ratatui::Frame, state: &WelcomeState) {
         card.height.saturating_sub(2),
     );
 
-    // Build up the form line by line. `Vec<Line>` is a dynamically-sized
-    // array (growable, heap-allocated). We push lines as we go.
     let mut lines: Vec<Line> = Vec::new();
 
     // Subtitle
     lines.push(Line::from(Span::styled(
         "P2P terminal chat over iroh gossip",
         Style::default()
-            .fg(Color::DarkGray)
+            .fg(theme.text_dim)
             .add_modifier(Modifier::ITALIC),
     )));
     lines.push(Line::from(""));
 
     // ── Name field ───────────────────────────────────────────────────────
 
-    // Highlight the active field's label with cyan/bold; others are plain white.
     let name_style = if state.field == WelcomeField::Name {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(theme.text)
     };
     let name_label = if state.field == WelcomeField::Name {
         "> Name: "
     } else {
         "  Name: "
     };
-    // A `Line` made of multiple `Span`s — each Span has its own style.
-    // This is how ratatui does inline styling (like HTML <span> tags).
     lines.push(Line::from(vec![
         Span::styled(name_label, name_style),
-        Span::styled(&state.name, Style::default().fg(Color::White)),
+        Span::styled(&state.name, Style::default().fg(theme.text)),
         if state.field == WelcomeField::Name {
-            Span::styled("_", Style::default().fg(Color::DarkGray))
+            Span::styled("_", Style::default().fg(theme.cursor_blink))
         } else {
             Span::raw("")
         },
@@ -236,31 +231,29 @@ fn ui_welcome(f: &mut ratatui::Frame, state: &WelcomeState) {
 
     let mode_style = if state.field == WelcomeField::Mode {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(theme.text)
     };
     let mode_label = if state.field == WelcomeField::Mode {
         "> Mode: "
     } else {
         "  Mode: "
     };
-    // Destructuring a tuple: `let (a, b) = expr;` binds both values at once.
-    // The selected mode gets a highlighted style (black text on cyan bg).
     let (create_style, join_style) = match state.mode {
         RoomMode::Create => (
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(theme.accent_on_bg)
+                .bg(theme.accent_bg)
                 .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_muted),
         ),
         RoomMode::Join => (
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_muted),
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(theme.accent_on_bg)
+                .bg(theme.accent_bg)
                 .add_modifier(Modifier::BOLD),
         ),
     };
@@ -274,16 +267,15 @@ fn ui_welcome(f: &mut ratatui::Frame, state: &WelcomeState) {
 
     // ── Ticket field ─────────────────────────────────────────────────────
 
-    // The ticket field is only active in Join mode; otherwise it's grayed out.
     let ticket_active = state.mode == RoomMode::Join;
     let ticket_style = if !ticket_active {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.text_muted)
     } else if state.field == WelcomeField::Ticket {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(theme.text)
     };
     let ticket_label = if state.field == WelcomeField::Ticket {
         "> Ticket: "
@@ -291,9 +283,6 @@ fn ui_welcome(f: &mut ratatui::Frame, state: &WelcomeState) {
         "  Ticket: "
     };
 
-    // Tickets are long base32 strings — show a scrolling window of 30 chars.
-    // `String` slicing with `[start..end]` works on byte indices; this is safe
-    // because base32 is pure ASCII.
     let ticket_display: String = if state.ticket.len() > 30 {
         let start = state.ticket_cursor.saturating_sub(15);
         let end = (start + 30).min(state.ticket.len());
@@ -308,13 +297,13 @@ fn ui_welcome(f: &mut ratatui::Frame, state: &WelcomeState) {
         Span::styled(
             &ticket_display,
             if ticket_active {
-                Style::default().fg(Color::White)
+                Style::default().fg(theme.text)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(theme.text_muted)
             },
         ),
         if state.field == WelcomeField::Ticket && ticket_active {
-            Span::styled("_", Style::default().fg(Color::DarkGray))
+            Span::styled("_", Style::default().fg(theme.cursor_blink))
         } else {
             Span::raw("")
         },
@@ -323,15 +312,11 @@ fn ui_welcome(f: &mut ratatui::Frame, state: &WelcomeState) {
 
     // ── Error or hint line ───────────────────────────────────────────────
 
-    // `if let Some(err) = &state.error` is Rust's *refutable pattern match* —
-    // it tries to match `Some(...)` and binds the inner value, or falls through
-    // to `else`. This is more concise than `match` when you only care about
-    // one variant.
     if let Some(err) = &state.error {
         lines.push(Line::from(Span::styled(
             format!("  {err}"),
             Style::default()
-                .fg(Color::Red)
+                .fg(theme.error)
                 .add_modifier(Modifier::BOLD),
         )));
     } else {
@@ -339,32 +324,30 @@ fn ui_welcome(f: &mut ratatui::Frame, state: &WelcomeState) {
             Span::styled(
                 "  Enter",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.hint_key)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" to start  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" to start  ", Style::default().fg(theme.hint_text)),
             Span::styled(
                 "Tab",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.hint_key)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" next field  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" next field  ", Style::default().fg(theme.hint_text)),
             Span::styled(
                 "Esc",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.hint_key)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+            Span::styled(" quit", Style::default().fg(theme.hint_text)),
         ]));
     }
 
     let widget = Paragraph::new(lines);
     f.render_widget(widget, inner);
 
-    // Position the terminal cursor in the active text field so the user sees
-    // where their typing will appear.
     match state.field {
         WelcomeField::Name => {
             f.set_cursor_position((inner.x + 8 + state.name_cursor as u16, inner.y + 2));
@@ -378,8 +361,6 @@ fn ui_welcome(f: &mut ratatui::Frame, state: &WelcomeState) {
             };
             f.set_cursor_position((inner.x + 10 + display_cursor, inner.y + 6));
         }
-        // `_ => {}` is the catch-all arm — handles Mode field and Ticket
-        // field when not in Join mode (no visible cursor needed).
         _ => {}
     }
 }
@@ -526,46 +507,32 @@ fn handle_text_input(text: &mut String, cursor: &mut usize, key: crossterm::even
 /// `Option<WelcomeResult>` nested inside `Result` is a common Rust pattern:
 /// `Result` handles errors, `Option` handles "no value" — they compose cleanly.
 pub async fn run_welcome_screen() -> Result<Option<WelcomeResult>> {
-    // Enable raw mode: keys are delivered immediately (no line buffering) and
-    // aren't echoed. `?` propagates any error to the caller.
     enable_raw_mode()?;
-    // `execute!` writes the `EnterAlternateScreen` command to stdout, which
-    // switches to the alternate screen buffer (preserving the original terminal
-    // contents for when we leave).
     execute!(std::io::stdout(), EnterAlternateScreen)?;
     let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(
         std::io::stdout(),
     ))?;
 
     let mut state = WelcomeState::new();
-    // `EventStream` is an async stream of terminal events (keys, mouse, resize).
+    let mut theme = Theme::dark();
     let mut events = EventStream::new();
-    // `interval` creates an async timer that ticks every 50ms — used to drive
-    // UI redraws even when no input arrives (e.g. for animations or clock updates).
     let mut tick = interval(Duration::from_millis(50));
 
-    // `loop` with `break value` is Rust's "loop that returns a value" pattern.
-    // The `break None` / `break Some(...)` at various points all produce
-    // `Option<WelcomeResult>` which is bound to `result`.
     let result = loop {
-        // Draw the current frame. The closure `|f| ui_welcome(f, &state)`
-        // captures `&state` by reference — closures in Rust automatically
-        // borrow their environment.
-        terminal.draw(|f| ui_welcome(f, &state))?;
+        terminal.draw(|f| ui_welcome(f, &state, &theme))?;
 
-        // `tokio::select!` waits for the *first* of multiple async operations
-        // to complete, then executes the corresponding branch. Other branches
-        // are cancelled. This is how we multiplex keyboard input and timer ticks
-        // without threads.
         tokio::select! {
             ev = events.next() => {
-                // Nested pattern match: `Some(Ok(TermEvent::Key(key)))` unwraps
-                // three layers at once — the Option from the stream, the Result
-                // from event reading, and the Event variant.
                 if let Some(Ok(TermEvent::Key(key))) = ev {
-                    // Filter out key release/repeat events (Windows sends both
-                    // press and release events).
                     if key.kind != KeyEventKind::Press { continue; }
+
+                    // Handle Ctrl+T theme toggle before other keys
+                    if key.code == KeyCode::Char('t')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        theme.toggle();
+                        continue;
+                    }
 
                     handle_welcome_key(&mut state, key);
 
@@ -573,7 +540,6 @@ pub async fn run_welcome_screen() -> Result<Option<WelcomeResult>> {
                         break None;
                     }
 
-                    // Check if Enter was pressed and validation passed
                     if key.code == KeyCode::Enter && state.error.is_none() {
                         let nickname = state.name.trim().to_string();
                         break match state.mode {
@@ -586,14 +552,10 @@ pub async fn run_welcome_screen() -> Result<Option<WelcomeResult>> {
                     }
                 }
             }
-            // The tick branch just triggers a redraw (the `terminal.draw()`
-            // call at the top of the loop).
             _ = tick.tick() => {}
         }
     };
 
-    // Restore the terminal to its original state before returning.
-    // This runs even on early `break` — Rust's control flow ensures cleanup.
     disable_raw_mode()?;
     execute!(std::io::stdout(), LeaveAlternateScreen)?;
 

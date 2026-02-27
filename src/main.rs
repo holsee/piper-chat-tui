@@ -18,6 +18,7 @@
 mod chat;
 mod filepicker;
 mod net;
+mod theme;
 mod transfer;
 mod welcome;
 
@@ -357,6 +358,9 @@ async fn main() -> Result<()> {
                                 KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                     app.open_file_picker();
                                 }
+                                KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    app.theme.toggle();
+                                }
                                 KeyCode::Enter => {
                                     // `drain(..)` removes all characters from the String
                                     // and returns them as an iterator. `.collect()` gathers
@@ -651,6 +655,7 @@ fn show_help(app: &mut App) {
     app.system("── Keys (chat) ───────────────────────────");
     app.system("  Enter        Send message");
     app.system("  Ctrl+F       Open file picker");
+    app.system("  Ctrl+T       Toggle dark/light theme");
     app.system("  Tab          Focus file pane (when visible)");
     app.system("  Esc          Quit");
     app.system("── Keys (file pane) ──────────────────────");

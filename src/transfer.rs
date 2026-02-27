@@ -32,10 +32,12 @@ use iroh_blobs::Hash;
 // - `Paragraph`: a multi-line text widget that renders a `Vec<Line>`.
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
+
+use crate::theme::Theme;
 // `PathBuf` is an owned filesystem path (the `String` of paths).
 // Used in `TransferState::Complete` to store where the downloaded file was saved.
 use std::path::PathBuf;
@@ -288,16 +290,20 @@ pub fn render_file_pane(
     area: Rect,
     manager: &TransferManager,
     focused: bool,
+    theme: &Theme,
 ) {
-    let border_color = if focused { Color::Cyan } else { Color::White };
+    let border_color = if focused {
+        theme.border_focused
+    } else {
+        theme.border
+    };
     let block = Block::default()
         .borders(Borders::ALL)
+        .style(Style::default().bg(theme.bg))
         .border_style(Style::default().fg(border_color))
-        .title("files");
+        .title("files")
+        .title_style(Style::default().fg(theme.title));
 
-    // Build one `Line` per transfer entry using iterator chains.
-    // `.enumerate()` wraps each element with its index `(i, entry)` — we need
-    // the index to determine if this row is currently selected.
     let lines: Vec<Line> = manager
         .entries
         .iter()
@@ -307,37 +313,29 @@ pub fn render_file_pane(
             let prefix = if is_selected { "> " } else { "  " };
             let name_style = if is_selected {
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(theme.accent)
             };
 
             let sender = &entry.offer.sender_nickname;
             let filename = &entry.offer.filename;
             let size = format_file_size(entry.offer.size);
 
-            // Build the state indicator span — each transfer state gets a
-            // different visual representation.
             let state_span = match &entry.state {
                 TransferState::Pending => {
-                    Span::styled("[ dl ]", Style::default().fg(Color::Yellow))
+                    Span::styled("[ dl ]", Style::default().fg(theme.transfer_pending))
                 }
                 TransferState::Downloading {
                     bytes_received,
                     total_bytes,
                 } => {
-                    // Calculate download percentage (0–100).
                     let pct = if *total_bytes > 0 {
                         (*bytes_received as f64 / *total_bytes as f64 * 100.0) as u64
                     } else {
                         0
                     };
-                    // Build a 6-character progress bar using Unicode block characters:
-                    // - U+2588 (█) "full block" for filled portion
-                    // - U+2591 (░) "light shade" for empty portion
-                    // `.repeat(n)` creates a String of n copies of the character.
-                    // `.min(6)` clamps the filled count to prevent overflow.
                     let filled = (pct as usize * 6 / 100).min(6);
                     let empty = 6 - filled;
                     let bar = format!(
@@ -345,35 +343,30 @@ pub fn render_file_pane(
                         "\u{2588}".repeat(filled),
                         "\u{2591}".repeat(empty)
                     );
-                    Span::styled(bar, Style::default().fg(Color::Green))
+                    Span::styled(bar, Style::default().fg(theme.transfer_progress))
                 }
                 TransferState::Complete(_) => {
-                    Span::styled("[open dir]", Style::default().fg(Color::Green))
+                    Span::styled("[open dir]", Style::default().fg(theme.transfer_complete))
                 }
                 TransferState::Failed(err) => {
-                    // Truncate long error messages to keep the UI tidy.
-                    // `.chars().take(17).collect()` iterates Unicode characters
-                    // (not bytes) and collects the first 17 into a new String.
                     let truncated: String = err.chars().take(17).collect();
                     let msg = if err.len() > 20 {
                         format!("[err: {truncated}...]")
                     } else {
                         format!("[err: {err}]")
                     };
-                    Span::styled(msg, Style::default().fg(Color::Red))
+                    Span::styled(msg, Style::default().fg(theme.transfer_failed))
                 }
                 TransferState::Sharing => {
-                    Span::styled("[sharing]", Style::default().fg(Color::Blue))
+                    Span::styled("[sharing]", Style::default().fg(theme.transfer_sharing))
                 }
             };
 
-            // Compose the line from multiple spans — each with its own style.
-            // `Line::from(Vec<Span>)` concatenates them horizontally.
             Line::from(vec![
                 Span::styled(prefix, name_style),
                 Span::styled(format!("{sender}: "), name_style),
-                Span::styled(format!("{filename} "), Style::default().fg(Color::White)),
-                Span::styled(format!("({size})  "), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{filename} "), Style::default().fg(theme.text)),
+                Span::styled(format!("({size})  "), Style::default().fg(theme.text_muted)),
                 state_span,
             ])
         })

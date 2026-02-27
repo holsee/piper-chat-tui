@@ -18,7 +18,7 @@ use iroh::EndpointId;
 // - `Block` / `Borders` / `Paragraph`: widget types for bordered text panels
 use ratatui::{
     layout::{Constraint, Layout},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
@@ -29,6 +29,7 @@ use ratatui::{
 // are network types, and `TransferManager` manages file transfer state.
 use crate::filepicker::FilePicker;
 use crate::net::{ConnType, PeerInfo};
+use crate::theme::Theme;
 use crate::transfer::{self, TransferManager};
 
 // ── App state ────────────────────────────────────────────────────────────────
@@ -100,6 +101,8 @@ pub struct App {
     pub file_picker: Option<FilePicker>,
     /// All file transfer entries (sent and received).
     pub transfers: TransferManager,
+    /// The active color theme (dark or light), toggled with Ctrl+T.
+    pub theme: Theme,
 }
 
 /// The `impl` block contains methods associated with the `App` type.
@@ -124,6 +127,7 @@ impl App {
             mode: AppMode::Chat,
             file_picker: None,
             transfers: TransferManager::new(),
+            theme: Theme::dark(),
         }
     }
 
@@ -134,7 +138,7 @@ impl App {
     /// If the current directory is unreadable, the picker silently fails to open
     /// (a more robust app would show an error message).
     pub fn open_file_picker(&mut self) {
-        if let Ok(picker) = FilePicker::new() {
+        if let Ok(picker) = FilePicker::new(&self.theme) {
             self.file_picker = Some(picker);
             self.mode = AppMode::FilePicker;
         }
@@ -199,6 +203,10 @@ impl App {
 /// `render_widget()` to place widgets at specific screen rectangles, and
 /// `set_cursor_position()` to show the blinking cursor.
 pub fn ui(f: &mut ratatui::Frame, app: &App) {
+    // Paint the full-screen background so the theme bg covers the terminal area.
+    let bg_block = Block::default().style(Style::default().bg(app.theme.bg));
+    f.render_widget(bg_block, f.area());
+
     // Build the vertical layout — conditionally include the file pane row when
     // there are active offers/transfers. This demonstrates ratatui's `Layout`
     // system: you specify constraints (Min, Length, Percentage) and the layout
@@ -228,37 +236,34 @@ pub fn ui(f: &mut ratatui::Frame, app: &App) {
     // gathers results into a `Vec<Line>`. This is Rust's iterator chain
     // pattern — lazy evaluation, zero allocation overhead (the compiler fuses
     // the iterator chain into a single loop).
+    let theme = &app.theme;
     let lines: Vec<Line> = app
         .messages
         .iter()
         .map(|msg| match msg {
-            // Pattern matching on enum variants with destructuring:
-            // `ChatLine::System(text)` binds the inner String to `text`.
             ChatLine::System(text) => Line::from(Span::styled(
                 format!("[system] {text}"),
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(theme.text_dim)
                     .add_modifier(Modifier::ITALIC),
             )),
             ChatLine::Ticket(ticket) => Line::from(vec![
                 Span::styled(
                     "Ticket: ",
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(theme.ticket_label)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(ticket.as_str(), Style::default().fg(Color::White)),
+                Span::styled(ticket.as_str(), Style::default().fg(theme.ticket_value)),
             ]),
-            // Struct variant destructuring: `{ nickname, text }` pulls out
-            // named fields directly into local variables.
             ChatLine::Chat { nickname, text } => Line::from(vec![
                 Span::styled(
                     nickname.as_str(),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme.nickname)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!(": {text}")),
+                Span::styled(format!(": {text}"), Style::default().fg(theme.text)),
             ]),
         })
         .collect();
@@ -270,7 +275,14 @@ pub fn ui(f: &mut ratatui::Frame, app: &App) {
 
     let messages_widget = Paragraph::new(lines)
         .scroll((scroll, 0))
-        .block(Block::default().borders(Borders::ALL).title("piper-chat"));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .style(Style::default().bg(theme.bg))
+                .border_style(Style::default().fg(theme.border))
+                .title("piper-chat")
+                .title_style(Style::default().fg(theme.title)),
+        );
     f.render_widget(messages_widget, top[0]);
 
     // ── Peers pane (top right) ───────────────────────────────────────────
@@ -283,18 +295,24 @@ pub fn ui(f: &mut ratatui::Frame, app: &App) {
         .values()
         .map(|peer| {
             let (tag, tag_color) = match peer.conn_type {
-                ConnType::Direct => ("[direct]", Color::Green),
-                ConnType::Relay => ("[relay]", Color::Yellow),
-                ConnType::Unknown => ("[?]", Color::DarkGray),
+                ConnType::Direct => ("[direct]", theme.conn_direct),
+                ConnType::Relay => ("[relay]", theme.conn_relay),
+                ConnType::Unknown => ("[?]", theme.conn_unknown),
             };
             Line::from(vec![
                 Span::styled(format!("{tag} "), Style::default().fg(tag_color)),
-                Span::styled(peer.name.as_str(), Style::default().fg(Color::Green)),
+                Span::styled(peer.name.as_str(), Style::default().fg(theme.peer_name)),
             ])
         })
         .collect();
-    let peers_widget = Paragraph::new(peer_lines)
-        .block(Block::default().borders(Borders::ALL).title("peers"));
+    let peers_widget = Paragraph::new(peer_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .style(Style::default().bg(theme.bg))
+            .border_style(Style::default().fg(theme.border))
+            .title("peers")
+            .title_style(Style::default().fg(theme.title)),
+    );
     f.render_widget(peers_widget, top[1]);
 
     // ── Input pane (bottom, full width) ──────────────────────────────────
@@ -308,13 +326,18 @@ pub fn ui(f: &mut ratatui::Frame, app: &App) {
     // block when you just need a boolean. The input border is cyan when
     // focused (Chat mode) and white otherwise, providing a visual focus indicator.
     let input_border_color = if matches!(app.mode, AppMode::Chat) {
-        Color::Cyan
+        theme.border_focused
     } else {
-        Color::White
+        theme.border
     };
-    let input_widget = Paragraph::new(format!("> {}", app.input)).block(
+    let input_widget = Paragraph::new(Line::from(vec![
+        Span::styled("> ", Style::default().fg(theme.input_prompt)),
+        Span::styled(&app.input, Style::default().fg(theme.text)),
+    ]))
+    .block(
         Block::default()
             .borders(Borders::ALL)
+            .style(Style::default().bg(theme.bg))
             .border_style(Style::default().fg(input_border_color)),
     );
     f.render_widget(input_widget, rows[input_row]);
@@ -331,10 +354,8 @@ pub fn ui(f: &mut ratatui::Frame, app: &App) {
     // ── File share pane (between messages and input) ─────────────────
 
     if app.transfers.has_entries() {
-        // `matches!` macro checks if `app.mode` is the `FilePane` variant.
         let focused = matches!(app.mode, AppMode::FilePane);
-        // Delegate rendering to the transfer module's render function.
-        transfer::render_file_pane(f, rows[1], &app.transfers, focused);
+        transfer::render_file_pane(f, rows[1], &app.transfers, focused, theme);
     }
 
     // ── File picker overlay (on top of everything) ───────────────────
