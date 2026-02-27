@@ -137,15 +137,30 @@ impl Ticket for ChatTicket {
 // DERP server. We track which type each peer uses, updating on every handshake.
 
 /// Whether a peer connection is direct (IP), relayed, or not yet determined.
+///
+/// Iroh's QUIC connections start as relayed (through a DERP relay server) and
+/// may upgrade to direct (UDP hole-punched) once both peers discover each other's
+/// public IP. This enum tracks the current state for display in the peers panel.
 pub enum ConnType {
+    /// Connection type not yet determined (peer just connected).
     Unknown,
+    /// Direct UDP connection — lowest latency, no relay overhead.
     Direct,
+    /// Traffic is being relayed through a DERP server — higher latency but
+    /// works even when both peers are behind restrictive NATs.
     Relay,
 }
 
 /// Display information about a connected peer.
+///
+/// This struct bundles the peer's display name with their connection type.
+/// It's stored in `App.peers` (a `BTreeMap<EndpointId, PeerInfo>`) and
+/// rendered in the peers sidebar.
 pub struct PeerInfo {
+    /// Display name — either their chosen nickname (after receiving a Join message)
+    /// or a short hex prefix of their endpoint ID (before they identify themselves).
     pub name: String,
+    /// Current connection type — updated periodically from the `ConnTracker`.
     pub conn_type: ConnType,
 }
 

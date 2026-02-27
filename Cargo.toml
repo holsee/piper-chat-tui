@@ -1,23 +1,94 @@
 [package]
 name = "piper-chat"
 version = "0.1.0"
+# `edition = "2024"` opts into the latest Rust edition, which controls language
+# defaults like the `use` prelude and `unsafe` scoping rules. Editions are
+# backwards-compatible — older code still compiles, but new code gets modern defaults.
 edition = "2024"
+# Dual license: MIT OR Apache-2.0 is the standard Rust ecosystem convention,
+# matching the Rust compiler itself. Users can choose whichever license they prefer.
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+# Flexible error handling: wraps any `std::error::Error` into a single `anyhow::Error`
+# type, so you can use `?` across different error types without writing custom enums.
+# `Result<T>` is shorthand for `Result<T, anyhow::Error>`.
 anyhow = "1"
+
+# Command-line argument parser. The "derive" feature enables `#[derive(Parser)]`
+# which auto-generates a CLI parser from your struct/enum definitions at compile time.
+# Without "derive", you'd have to build the parser programmatically.
 clap = { version = "4", features = ["derive"] }
+
+# Cross-platform terminal manipulation: raw mode, alternate screen, key events.
+# The "event-stream" feature adds `EventStream` — an async `Stream` of terminal
+# events, enabling integration with `tokio::select!` for non-blocking input.
 crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Platform-aware directory paths (e.g. `dirs::data_dir()` returns
+# `~/.local/share` on Linux, `%APPDATA%` on Windows, `~/Library/Application Support`
+# on macOS). Used to store the blob database in a standard location.
 dirs = "6"
+
+# iroh: peer-to-peer networking built on QUIC. Provides `Endpoint` (the network
+# identity + connection manager), `EndpointId` (a 32-byte public key), and
+# `protocol::Router` (multiplexes multiple protocols over one endpoint).
+# `default-features = false` disables optional features we don't need (e.g. metrics).
 iroh = { version = "0.96", default-features = false }
+
+# Content-addressed blob storage and transfer. Files are identified by their
+# BLAKE3 hash — if two peers have the same hash, they have the same bytes.
+# The "fs-store" feature enables `FsStore`, which persists blobs to disk using
+# the `redb` embedded database. Without it, blobs would only live in memory.
 iroh-blobs = { version = "0.98", default-features = false, features = ["fs-store"] }
+
+# Gossip pub-sub protocol for broadcasting messages to a topic (chat room).
+# The "net" feature enables the networking layer (`Gossip`, `GOSSIP_ALPN`) that
+# runs gossip over iroh's QUIC connections. Without it, only the in-memory
+# protocol logic is available (useful for testing).
 iroh-gossip = { version = "0.96", default-features = false, features = ["net"] }
+
+# Base32 ticket serialization: the `Ticket` trait provides `serialize()`/`deserialize()`
+# for encoding connection info as copy-paste-friendly strings.
 iroh-tickets = "0.3"
+
+# Open files and URLs with the system default handler (e.g. `open::that(path)`
+# launches the file explorer on the download directory).
 open = "5"
+
+# Async stream utilities from the n0 (number zero) project. Provides `StreamExt`
+# with `.next()` for consuming async streams — used for gossip event streams
+# and terminal event streams.
 n0-future = "0.3"
+
+# Compact binary serialization format. Smaller and faster than JSON, designed for
+# embedded/no_std environments. The "alloc" feature enables `to_stdvec()` which
+# returns a `Vec<u8>` (requires heap allocation). We use postcard for all wire
+# protocol messages and ticket serialization.
 postcard = { version = "1", features = ["alloc"] }
+
+# Random number generation. Used to generate random `TopicId` bytes when creating
+# a new chat room. `rand::random::<[u8; 32]>()` fills a 32-byte array with
+# cryptographically-strong random bytes.
 rand = "0.9"
+
+# Terminal UI framework using an immediate-mode rendering model: every frame,
+# you build the entire UI from current state — no retained widget tree.
+# Provides `Layout`, `Block`, `Paragraph`, `Span`/`Line` for styled text.
 ratatui = "0.29"
+
+# File explorer widget for ratatui. Provides `FileExplorer` — a ready-made
+# filesystem browser with keyboard navigation (up/down/enter/esc), theming,
+# and directory traversal. We wrap it in our modal `FilePicker` overlay.
 ratatui-explorer = "0.2"
+
+# Serialization framework. The "derive" feature enables `#[derive(Serialize, Deserialize)]`
+# which generates serialization code at compile time via procedural macros.
+# serde itself is format-agnostic — the actual encoding is done by `postcard`.
 serde = { version = "1", features = ["derive"] }
+
+# Async runtime. "rt-multi-thread" enables the multi-threaded scheduler (uses a
+# thread pool to run futures, as opposed to "rt" which is single-threaded).
+# "macros" enables `#[tokio::main]` which transforms `async fn main()` into a
+# synchronous entry point that creates and runs the tokio runtime.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
