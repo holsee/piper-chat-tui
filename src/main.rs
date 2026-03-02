@@ -46,7 +46,10 @@ use clap::Parser;
 // - `EnterAlternateScreen`/`LeaveAlternateScreen`: uses the terminal's alternate
 //   buffer so the original scrollback is preserved when the app exits
 use crossterm::{
-    event::{Event as TermEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream, KeyCode,
+        KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -81,9 +84,9 @@ use tokio::time::{Duration, interval};
 
 // Imports from our own crate modules — `use chat::App` brings `chat::App`
 // into scope so we can write `App` instead of `chat::App`.
-use chat::{ui, App, AppMode};
+use chat::{ui, App, AppMode, ClickAction, MediaInfo};
 use filepicker::FilePickerResult;
-use net::{ChatTicket, ConnTracker, ConnType, Message, PeerInfo};
+use net::{ChatTicket, ConnTracker, ConnType, Message, PeerInfo, new_message_id, now_ms};
 use transfer::{FileOffer, TransferEvent, TransferState};
 use welcome::{run_welcome_screen, WelcomeResult};
 
@@ -273,6 +276,10 @@ async fn main() -> Result<()> {
     // main loop falls behind, senders will wait rather than using unbounded memory.
     let (transfer_tx, mut transfer_rx) = tokio::sync::mpsc::channel::<TransferEvent>(64);
 
+    // Channel for history sync: background task sends `Result<Vec<u8>>`.
+    let (history_tx, mut history_rx) =
+        tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(4);
+
     // ── Terminal setup ───────────────────────────────────────────────────────
 
     // `enable_raw_mode()` puts the terminal into raw mode:
@@ -285,7 +292,7 @@ async fn main() -> Result<()> {
     // `EnterAlternateScreen` switches to the terminal's alternate screen buffer,
     // preserving the user's original scrollback. When we `LeaveAlternateScreen`
     // later, the original terminal content is restored — the chat UI disappears.
-    execute!(std::io::stdout(), EnterAlternateScreen)?;
+    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     // Create a ratatui `Terminal` backed by crossterm. The terminal manages a
     // double-buffer: widgets draw to a back buffer, then `draw()` diffs it against
     // the front buffer and emits only the changed cells — minimizing terminal I/O.
@@ -305,7 +312,8 @@ async fn main() -> Result<()> {
             conn_type: ConnType::Unknown,
         },
     );
-    app.ticket(ticket_str);
+    app.ticket(ticket_str.clone());
+    app.ticket_str = Some(ticket_str);
     app.system("share the ticket above with others to join");
     app.system("type /help for commands | waiting for peers...");
 
@@ -330,7 +338,7 @@ async fn main() -> Result<()> {
         // widgets at specific `Rect` positions. After the closure returns,
         // ratatui diffs the new buffer against the previous frame and emits
         // only the terminal escape sequences needed to update changed cells.
-        terminal.draw(|f| ui(f, &app))?;
+        terminal.draw(|f| ui(f, &mut app))?;
 
         tokio::select! {
             // ── Branch 1: Keyboard input ─────────────────────────────────
@@ -361,6 +369,9 @@ async fn main() -> Result<()> {
                                 KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                     app.theme.toggle();
                                 }
+                                KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    copy_ticket_to_clipboard(&mut app);
+                                }
                                 KeyCode::Enter => {
                                     // `drain(..)` removes all characters from the String
                                     // and returns them as an iterator. `.collect()` gathers
@@ -373,21 +384,17 @@ async fn main() -> Result<()> {
                                     } else if text.trim() == "/send" {
                                         app.open_file_picker();
                                     } else if !text.is_empty() {
+                                        let mid = new_message_id();
+                                        let ts = now_ms();
                                         let msg = Message::Chat {
                                             nickname: nickname.clone(),
                                             text: text.clone(),
+                                            message_id: mid,
+                                            timestamp_ms: ts,
                                         };
-                                        // `postcard::to_stdvec()` serializes the message
-                                        // into a compact binary `Vec<u8>`.
                                         let encoded = postcard::to_stdvec(&msg)?;
-                                        // `.into()` converts `Vec<u8>` into `Bytes` — a
-                                        // reference-counted byte buffer. `Bytes::from(Vec)`
-                                        // is zero-copy: it takes ownership of the Vec's
-                                        // allocation without copying. The `sender.broadcast()`
-                                        // method expects `Bytes` because it may need to
-                                        // clone the data for multiple recipients cheaply.
                                         sender.broadcast(encoded.into()).await?;
-                                        app.chat(nickname.clone(), text);
+                                        app.chat(nickname.clone(), text, mid, ts);
                                     }
                                 }
                                 KeyCode::Backspace => {
@@ -433,7 +440,7 @@ async fn main() -> Result<()> {
                                             our_id,
                                             &path,
                                         ).await {
-                                            Ok((hash, filename, size)) => {
+                                            Ok((hash, filename, size, mid, ts, mime_type)) => {
                                                 let offer = FileOffer {
                                                     sender_nickname: "You".to_string(),
                                                     sender_id: our_id,
@@ -442,7 +449,23 @@ async fn main() -> Result<()> {
                                                     hash,
                                                 };
                                                 app.transfers.add_sent(offer);
-                                                app.system(format!("sharing: {filename}"));
+                                                // Show media card for images/videos
+                                                if let Some(ref mt) = mime_type
+                                                    && (transfer::is_image_mime(mt) || transfer::is_video_mime(mt))
+                                                {
+                                                    app.media(MediaInfo {
+                                                        message_id: mid,
+                                                        timestamp_ms: ts,
+                                                        nickname: "You".into(),
+                                                        filename,
+                                                        size,
+                                                        hash: *hash.as_bytes(),
+                                                        mime_type: mt.clone(),
+                                                        endpoint_id: our_id,
+                                                    });
+                                                } else {
+                                                    app.system(format!("sharing: {filename}"));
+                                                }
                                             }
                                             Err(e) => {
                                                 app.system(format!("failed to share file: {e}"));
@@ -506,6 +529,32 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+
+                // ── Mouse events ────────────────────────────────────────
+                if let Some(Ok(TermEvent::Mouse(mouse))) = &ev {
+                    match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            handle_mouse_click(
+                                &mut app,
+                                mouse.column,
+                                mouse.row,
+                                &blob_store,
+                                &endpoint,
+                                &download_dir,
+                                &transfer_tx,
+                            );
+                        }
+                        MouseEventKind::ScrollUp => {
+                            // Scroll up (back in history)
+                            app.scroll_offset = app.scroll_offset.saturating_add(3);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            // Scroll down (toward present)
+                            app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                        }
+                        _ => {}
+                    }
+                }
             }
 
             // ── Branch 2: Gossip network events ──────────────────────────
@@ -526,12 +575,15 @@ async fn main() -> Result<()> {
                                     conn_type: ConnType::Unknown,
                                 });
                             }
-                            Ok(Message::Chat { nickname, text }) => {
-                                app.chat(nickname, text);
+                            Ok(Message::Chat { nickname, text, message_id, timestamp_ms }) => {
+                                if !app.seen_ids.contains(&message_id) {
+                                    app.chat(nickname, text, message_id, timestamp_ms);
+                                }
                             }
-                            Ok(Message::FileOffer { nickname: name, endpoint_id, filename, size, hash }) => {
-                                // `Hash::from_bytes()` reconstructs the BLAKE3 hash
-                                // from the raw [u8; 32] bytes sent over the wire.
+                            Ok(Message::FileOffer { nickname: name, endpoint_id, filename, size, hash, message_id, timestamp_ms, mime_type }) => {
+                                if app.seen_ids.contains(&message_id) {
+                                    continue;
+                                }
                                 let blob_hash = Hash::from_bytes(hash);
                                 let offer = FileOffer {
                                     sender_nickname: name.clone(),
@@ -541,10 +593,77 @@ async fn main() -> Result<()> {
                                     hash: blob_hash,
                                 };
                                 app.transfers.add_offer(offer);
-                                app.system(format!(
-                                    "{name} shared: {filename} ({})",
-                                    transfer::format_file_size(size)
-                                ));
+
+                                // Show as media card if it's an image/video, else system msg.
+                                if let Some(ref mt) = mime_type
+                                    && (transfer::is_image_mime(mt) || transfer::is_video_mime(mt))
+                                {
+                                    app.media(MediaInfo {
+                                        message_id,
+                                        timestamp_ms,
+                                        nickname: name,
+                                        filename,
+                                        size,
+                                        hash,
+                                        mime_type: mt.clone(),
+                                        endpoint_id,
+                                    });
+                                } else {
+                                    // Record in history for non-media file offers.
+                                    app.seen_ids.insert(message_id);
+                                    app.push_history(net::HistoryEntry {
+                                        message_id,
+                                        timestamp_ms,
+                                        kind: net::HistoryEntryKind::FileOffer {
+                                            nickname: name.clone(),
+                                            endpoint_id,
+                                            filename: filename.clone(),
+                                            size,
+                                            hash,
+                                            mime_type,
+                                        },
+                                    });
+                                    app.system(format!(
+                                        "{name} shared: {filename} ({})",
+                                        transfer::format_file_size(size)
+                                    ));
+                                }
+                            }
+                            Ok(Message::HistoryOffer { message_count, hash, endpoint_id, .. }) => {
+                                if !app.history_synced {
+                                    app.history_synced = true;
+                                    app.system(format!("syncing {message_count} messages from history..."));
+                                    let blob_hash = Hash::from_bytes(hash);
+                                    // Spawn a background task to fetch the history blob.
+                                    let store = blob_store.clone();
+                                    let ep = endpoint.clone();
+                                    let htx = history_tx.clone();
+                                    tokio::spawn(async move {
+                                        let conn = match ep.connect(endpoint_id, BLOBS_ALPN).await {
+                                            Ok(c) => c,
+                                            Err(e) => {
+                                                let _ = htx.send(Err(format!("connect: {e}"))).await;
+                                                return;
+                                            }
+                                        };
+                                        let content = HashAndFormat::raw(blob_hash);
+                                        match store.remote().fetch(conn, content).await {
+                                            Ok(_) => {
+                                                match store.blobs().get_bytes(blob_hash).await {
+                                                    Ok(data) => {
+                                                        let _ = htx.send(Ok(data.to_vec())).await;
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = htx.send(Err(format!("read blob: {e}"))).await;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let _ = htx.send(Err(format!("fetch: {e}"))).await;
+                                            }
+                                        }
+                                    });
+                                }
                             }
                             Err(_) => {}
                         }
@@ -564,6 +683,24 @@ async fn main() -> Result<()> {
                         };
                         let encoded = postcard::to_stdvec(&join)?;
                         sender.broadcast(encoded.into()).await?;
+
+                        // Offer our history to the new peer if we have any.
+                        if !app.history.is_empty() {
+                            let history_bytes = postcard::to_stdvec(&app.history)?;
+                            let tag_info = blob_store.blobs().add_bytes(history_bytes).await?;
+                            let history_hash = *tag_info.hash.as_bytes();
+                            let oldest = app.history.first().map(|e| e.timestamp_ms).unwrap_or(0);
+                            let newest = app.history.last().map(|e| e.timestamp_ms).unwrap_or(0);
+                            let offer = Message::HistoryOffer {
+                                message_count: app.history.len() as u32,
+                                oldest_timestamp_ms: oldest,
+                                newest_timestamp_ms: newest,
+                                hash: history_hash,
+                                endpoint_id: our_id,
+                            };
+                            let encoded = postcard::to_stdvec(&offer)?;
+                            sender.broadcast(encoded.into()).await?;
+                        }
                     }
                     // `NeighborDown` fires when a peer disconnects from the topic.
                     // `.remove()` returns `Option<V>` — the value if the key existed.
@@ -611,7 +748,83 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // ── Branch 4: UI tick (50ms) ─────────────────────────────────
+            // ── Branch 4: History sync from background fetch ──────────────
+            Some(result) = history_rx.recv() => {
+                match result {
+                    Ok(data) => {
+                        match postcard::from_bytes::<Vec<net::HistoryEntry>>(&data) {
+                            Ok(mut entries) => {
+                                entries.sort_by_key(|e| e.timestamp_ms);
+                                let mut merged = 0u32;
+                                // Collect historical messages to prepend.
+                                let mut historical: Vec<chat::ChatLine> = Vec::new();
+                                for entry in entries {
+                                    if app.seen_ids.contains(&entry.message_id) {
+                                        continue;
+                                    }
+                                    app.seen_ids.insert(entry.message_id);
+                                    merged += 1;
+                                    match &entry.kind {
+                                        net::HistoryEntryKind::Chat { nickname, text } => {
+                                            historical.push(chat::ChatLine::Chat {
+                                                nickname: nickname.clone(),
+                                                text: text.clone(),
+                                                timestamp_ms: entry.timestamp_ms,
+                                            });
+                                        }
+                                        net::HistoryEntryKind::FileOffer {
+                                            nickname,
+                                            filename,
+                                            size,
+                                            hash,
+                                            mime_type,
+                                            ..
+                                        } => {
+                                            if let Some(mt) = mime_type
+                                                && (transfer::is_image_mime(mt) || transfer::is_video_mime(mt))
+                                            {
+                                                historical.push(chat::ChatLine::Media {
+                                                    timestamp_ms: entry.timestamp_ms,
+                                                    nickname: nickname.clone(),
+                                                    filename: filename.clone(),
+                                                    size: *size,
+                                                    hash: *hash,
+                                                    mime_type: mt.clone(),
+                                                });
+                                                continue;
+                                            }
+                                            historical.push(chat::ChatLine::System(format!(
+                                                "{nickname} shared: {filename} ({})",
+                                                transfer::format_file_size(*size)
+                                            )));
+                                        }
+                                        net::HistoryEntryKind::System(text) => {
+                                            historical.push(chat::ChatLine::System(text.clone()));
+                                        }
+                                    }
+                                    app.history.push(entry);
+                                }
+                                // Prepend historical messages before current session messages.
+                                historical.append(&mut app.messages);
+                                app.messages = historical;
+                                // Cap history at 1000.
+                                if app.history.len() > 1000 {
+                                    app.history.drain(0..app.history.len() - 1000);
+                                }
+                                app.system(format!("history sync complete: {merged} new messages"));
+                            }
+                            Err(e) => {
+                                app.system(format!("history sync failed: invalid data ({e})"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        app.system(format!("history sync failed: {e}"));
+                    }
+                }
+            }
+
+            // ── Branch 5: UI tick (50ms) ─────────────────────────────────
             // The tick branch fires every 50ms. We use it to poll connection
             // types — iroh may upgrade connections from relay to direct (via
             // UDP hole-punching) at any time, so we check periodically.
@@ -633,7 +846,7 @@ async fn main() -> Result<()> {
     // These cleanup calls mirror the setup — we disable raw mode and leave the
     // alternate screen to restore the user's original terminal state.
     disable_raw_mode()?;
-    execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
 
     // ── Shutdown ─────────────────────────────────────────────────────────────
     // `router.shutdown()` gracefully stops accepting new connections and waits
@@ -656,6 +869,7 @@ fn show_help(app: &mut App) {
     app.system("  Enter        Send message");
     app.system("  Ctrl+F       Open file picker");
     app.system("  Ctrl+T       Toggle dark/light theme");
+    app.system("  Ctrl+Y       Copy invite ticket to clipboard");
     app.system("  Tab          Focus file pane (when visible)");
     app.system("  Esc          Quit");
     app.system("── Keys (file pane) ──────────────────────");
@@ -667,7 +881,93 @@ fn show_help(app: &mut App) {
     app.system("  Left/Right   Parent / enter directory");
     app.system("  Enter        Select file to share");
     app.system("  Esc          Cancel");
+    app.system("── Mouse ─────────────────────────────────");
+    app.system("  Click        Focus pane / trigger action");
+    app.system("  Scroll       Scroll messages up/down");
     app.system("──────────────────────────────────────────");
+}
+
+// ── Mouse handling ───────────────────────────────────────────────────────────
+
+/// Handle a left mouse click by checking registered click regions.
+fn handle_mouse_click(
+    app: &mut App,
+    col: u16,
+    row: u16,
+    store: &FsStore,
+    endpoint: &iroh::Endpoint,
+    download_dir: &std::path::Path,
+    transfer_tx: &tokio::sync::mpsc::Sender<TransferEvent>,
+) {
+    // Iterate click regions in reverse so higher z-order (rendered last) wins.
+    for region in app.click_regions.iter().rev() {
+        if col >= region.rect.x
+            && col < region.rect.x + region.rect.width
+            && row >= region.rect.y
+            && row < region.rect.y + region.rect.height
+        {
+            match &region.action {
+                ClickAction::FocusChat => {
+                    app.focus_chat();
+                }
+                ClickAction::FocusFilePane => {
+                    app.focus_file_pane();
+                }
+                ClickAction::CopyTicket => {
+                    copy_ticket_to_clipboard(app);
+                }
+                ClickAction::DownloadTransfer(hash) => {
+                    let hash = *hash;
+                    if let Some(entry) = app
+                        .transfers
+                        .entries
+                        .iter()
+                        .find(|e| e.offer.hash == hash && matches!(e.state, TransferState::Pending))
+                    {
+                        let offer = entry.offer.clone();
+                        app.transfers.start_download(&hash);
+                        spawn_download(
+                            store,
+                            endpoint,
+                            offer,
+                            download_dir.to_path_buf(),
+                            transfer_tx.clone(),
+                        );
+                    }
+                }
+                ClickAction::OpenTransfer(hash) => {
+                    if let Some(entry) = app
+                        .transfers
+                        .entries
+                        .iter()
+                        .find(|e| e.offer.hash == *hash)
+                        && let TransferState::Complete(path) = &entry.state
+                    {
+                        let dir = path.parent().unwrap_or(download_dir);
+                        let _ = open::that(dir);
+                    }
+                }
+            }
+            break;
+        }
+    }
+}
+
+// ── Clipboard helpers ────────────────────────────────────────────────────────
+
+/// Copy the room ticket to the terminal clipboard using the OSC 52 escape
+/// sequence. This is supported by most modern terminals (kitty, iTerm2,
+/// alacritty, wezterm, Windows Terminal, etc.). Shows brief "Copied!" feedback.
+fn copy_ticket_to_clipboard(app: &mut App) {
+    use base64::Engine;
+    if let Some(ref ticket) = app.ticket_str {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(ticket.as_bytes());
+        // OSC 52: set clipboard. `c` = system clipboard.
+        let osc = format!("\x1b]52;c;{b64}\x07");
+        let _ = std::io::Write::write_all(&mut std::io::stdout(), osc.as_bytes());
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        app.copy_feedback_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+    }
 }
 
 // ── File sharing helpers ─────────────────────────────────────────────────────
@@ -680,14 +980,14 @@ fn show_help(app: &mut App) {
 /// - `&FsStore` / `&GossipSender`: borrowed references (we don't need ownership)
 /// - `&str` for `nickname`: a borrowed string slice (cheaper than `&String`)
 /// - `&std::path::Path` for `path`: a borrowed path slice (accepts both `&Path` and `&PathBuf`)
-/// - `Result<(Hash, String, u64)>`: returns a tuple wrapped in Result for error propagation
+/// - Returns `(hash, filename, size, message_id, timestamp, mime_type)` on success
 async fn share_file(
     store: &FsStore,
     sender: &iroh_gossip::api::GossipSender,
     nickname: &str,
     endpoint_id: iroh::EndpointId,
     path: &std::path::Path,
-) -> Result<(Hash, String, u64)> {
+) -> Result<(Hash, String, u64, net::MessageId, u64, Option<String>)> {
     // `file_name()` returns `Option<&OsStr>` — the last component of the path.
     // `to_string_lossy()` converts `OsStr` to a `Cow<str>`, replacing invalid
     // Unicode with the replacement character. `.to_string()` converts to owned.
@@ -707,21 +1007,24 @@ async fn share_file(
     let tag_info = store.blobs().add_path(path).await?;
     let hash = tag_info.hash;
 
-    // Broadcast the file offer to all peers via gossip.
-    // `*hash.as_bytes()` dereferences the `&[u8; 32]` to get the owned `[u8; 32]`
-    // array. We send raw bytes instead of the `Hash` type because `Hash` doesn't
-    // derive `Serialize` for postcard — raw bytes are more portable.
+    let mid = new_message_id();
+    let ts = now_ms();
+    let mime_type = transfer::mime_from_extension(&filename);
+
     let msg = Message::FileOffer {
         nickname: nickname.to_string(),
         endpoint_id,
         filename: filename.clone(),
         size,
         hash: *hash.as_bytes(),
+        message_id: mid,
+        timestamp_ms: ts,
+        mime_type: mime_type.clone(),
     };
     let encoded = postcard::to_stdvec(&msg)?;
     sender.broadcast(encoded.into()).await?;
 
-    Ok((hash, filename, size))
+    Ok((hash, filename, size, mid, ts, mime_type))
 }
 
 /// Spawn a background task that downloads a blob from a remote peer and exports

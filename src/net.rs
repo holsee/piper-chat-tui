@@ -29,6 +29,24 @@ use iroh_tickets::Ticket;
 // postcard (binary), etc. — a cornerstone of Rust's zero-boilerplate approach.
 use serde::{Deserialize, Serialize};
 
+// ── Message identity & timestamps ────────────────────────────────────────────
+
+/// A 128-bit random message identifier for deduplication during history merge.
+pub type MessageId = [u8; 16];
+
+/// Generate a new random 128-bit message ID.
+pub fn new_message_id() -> MessageId {
+    rand::random()
+}
+
+/// Current wall-clock time as milliseconds since UNIX epoch.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 // ── Wire protocol ────────────────────────────────────────────────────────────
 //
 // Every message sent over the gossip network is one of these variants.
@@ -51,7 +69,12 @@ pub enum Message {
         endpoint_id: EndpointId,
     },
     /// A regular chat message from a peer.
-    Chat { nickname: String, text: String },
+    Chat {
+        nickname: String,
+        text: String,
+        message_id: MessageId,
+        timestamp_ms: u64,
+    },
     /// A file offer — the sender has imported a file into their blob store
     /// and is advertising it so peers can download via iroh-blobs.
     FileOffer {
@@ -62,7 +85,49 @@ pub enum Message {
         /// The BLAKE3 hash of the file content, stored as raw bytes for
         /// compact serialization with postcard.
         hash: [u8; 32],
+        message_id: MessageId,
+        timestamp_ms: u64,
+        /// MIME type inferred from the file extension (e.g. "image/png").
+        mime_type: Option<String>,
     },
+    /// A peer is offering its chat history as a downloadable blob.
+    HistoryOffer {
+        message_count: u32,
+        oldest_timestamp_ms: u64,
+        newest_timestamp_ms: u64,
+        hash: [u8; 32],
+        endpoint_id: EndpointId,
+    },
+}
+
+// ── History entry (serializable storage format) ──────────────────────────────
+
+/// A single entry in the chat history log, serialized into a blob for
+/// history sync. Separate from the wire `Message` enum so we can evolve
+/// the storage format independently.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct HistoryEntry {
+    pub message_id: MessageId,
+    pub timestamp_ms: u64,
+    pub kind: HistoryEntryKind,
+}
+
+/// The payload of a history entry.
+#[derive(Serialize, Deserialize, Clone)]
+pub enum HistoryEntryKind {
+    Chat {
+        nickname: String,
+        text: String,
+    },
+    FileOffer {
+        nickname: String,
+        endpoint_id: EndpointId,
+        filename: String,
+        size: u64,
+        hash: [u8; 32],
+        mime_type: Option<String>,
+    },
+    System(String),
 }
 
 // ── Ticket ───────────────────────────────────────────────────────────────────
@@ -302,16 +367,26 @@ mod tests {
     /// Test that `Message::Chat` survives a postcard round-trip.
     #[test]
     fn message_chat_roundtrip() {
+        let mid = new_message_id();
         let msg = Message::Chat {
             nickname: "Alice".into(),
             text: "hello!".into(),
+            message_id: mid,
+            timestamp_ms: 1700000000000,
         };
         let bytes = postcard::to_stdvec(&msg).unwrap();
         let decoded: Message = postcard::from_bytes(&bytes).unwrap();
         match decoded {
-            Message::Chat { nickname, text } => {
+            Message::Chat {
+                nickname,
+                text,
+                message_id,
+                timestamp_ms,
+            } => {
                 assert_eq!(nickname, "Alice");
                 assert_eq!(text, "hello!");
+                assert_eq!(message_id, mid);
+                assert_eq!(timestamp_ms, 1700000000000);
             }
             _ => panic!("expected Chat variant"),
         }
@@ -344,12 +419,16 @@ mod tests {
     fn message_file_offer_roundtrip() {
         let id = iroh::EndpointId::from_bytes(&[3u8; 32]).unwrap();
         let hash = [7u8; 32];
+        let mid = new_message_id();
         let msg = Message::FileOffer {
             nickname: "Alice".into(),
             endpoint_id: id,
             filename: "photo.png".into(),
             size: 123456,
             hash,
+            message_id: mid,
+            timestamp_ms: 1700000000000,
+            mime_type: Some("image/png".into()),
         };
         let bytes = postcard::to_stdvec(&msg).unwrap();
         let decoded: Message = postcard::from_bytes(&bytes).unwrap();
@@ -360,15 +439,103 @@ mod tests {
                 filename,
                 size,
                 hash: h,
+                message_id,
+                timestamp_ms,
+                mime_type,
             } => {
                 assert_eq!(nickname, "Alice");
                 assert_eq!(endpoint_id, id);
                 assert_eq!(filename, "photo.png");
                 assert_eq!(size, 123456);
                 assert_eq!(h, hash);
+                assert_eq!(message_id, mid);
+                assert_eq!(timestamp_ms, 1700000000000);
+                assert_eq!(mime_type, Some("image/png".into()));
             }
             _ => panic!("expected FileOffer variant"),
         }
+    }
+
+    /// Test that `Message::HistoryOffer` survives a postcard round-trip.
+    #[test]
+    fn message_history_offer_roundtrip() {
+        let id = iroh::EndpointId::from_bytes(&[1u8; 32]).unwrap();
+        let hash = [9u8; 32];
+        let msg = Message::HistoryOffer {
+            message_count: 42,
+            oldest_timestamp_ms: 1700000000000,
+            newest_timestamp_ms: 1700000060000,
+            hash,
+            endpoint_id: id,
+        };
+        let bytes = postcard::to_stdvec(&msg).unwrap();
+        let decoded: Message = postcard::from_bytes(&bytes).unwrap();
+        match decoded {
+            Message::HistoryOffer {
+                message_count,
+                oldest_timestamp_ms,
+                newest_timestamp_ms,
+                hash: h,
+                endpoint_id,
+            } => {
+                assert_eq!(message_count, 42);
+                assert_eq!(oldest_timestamp_ms, 1700000000000);
+                assert_eq!(newest_timestamp_ms, 1700000060000);
+                assert_eq!(h, hash);
+                assert_eq!(endpoint_id, id);
+            }
+            _ => panic!("expected HistoryOffer variant"),
+        }
+    }
+
+    /// Test `HistoryEntry` postcard round-trip.
+    #[test]
+    fn history_entry_roundtrip() {
+        let mid = new_message_id();
+        let entry = HistoryEntry {
+            message_id: mid,
+            timestamp_ms: 1700000000000,
+            kind: HistoryEntryKind::Chat {
+                nickname: "Bob".into(),
+                text: "hi".into(),
+            },
+        };
+        let bytes = postcard::to_stdvec(&entry).unwrap();
+        let decoded: HistoryEntry = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.message_id, mid);
+        assert_eq!(decoded.timestamp_ms, 1700000000000);
+        match decoded.kind {
+            HistoryEntryKind::Chat { nickname, text } => {
+                assert_eq!(nickname, "Bob");
+                assert_eq!(text, "hi");
+            }
+            _ => panic!("expected Chat kind"),
+        }
+    }
+
+    /// Test `Vec<HistoryEntry>` round-trip (the history blob format).
+    #[test]
+    fn history_vec_roundtrip() {
+        let entries = vec![
+            HistoryEntry {
+                message_id: new_message_id(),
+                timestamp_ms: 1000,
+                kind: HistoryEntryKind::System("room created".into()),
+            },
+            HistoryEntry {
+                message_id: new_message_id(),
+                timestamp_ms: 2000,
+                kind: HistoryEntryKind::Chat {
+                    nickname: "Alice".into(),
+                    text: "hello".into(),
+                },
+            },
+        ];
+        let bytes = postcard::to_stdvec(&entries).unwrap();
+        let decoded: Vec<HistoryEntry> = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].timestamp_ms, 1000);
+        assert_eq!(decoded[1].timestamp_ms, 2000);
     }
 
     /// Test that `ConnTracker::new()` starts empty and returns `Unknown` for

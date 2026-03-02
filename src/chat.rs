@@ -7,7 +7,10 @@
 // `BTreeMap` is an ordered map backed by a B-tree. Unlike `HashMap`, it keeps
 // keys sorted — so the peers panel always displays peers in a consistent
 // (deterministic) order based on their `EndpointId`.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::time::Instant;
+
+use crate::net::{HistoryEntry, HistoryEntryKind, MessageId};
 
 // `EndpointId` is a 32-byte public key that uniquely identifies each iroh node.
 use iroh::EndpointId;
@@ -17,7 +20,7 @@ use iroh::EndpointId;
 // - `Line` / `Span`: styled text primitives — a `Line` is a row of `Span`s
 // - `Block` / `Borders` / `Paragraph`: widget types for bordered text panels
 use ratatui::{
-    layout::{Constraint, Layout},
+    layout::{Alignment, Constraint, Layout},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
@@ -27,6 +30,8 @@ use ratatui::{
 // `crate::` refers to the crate root (main.rs) — from there, Rust resolves the
 // module path. `FilePicker` is the modal overlay widget, `ConnType`/`PeerInfo`
 // are network types, and `TransferManager` manages file transfer state.
+use ratatui::layout::Rect;
+
 use crate::filepicker::FilePicker;
 use crate::net::{ConnType, PeerInfo};
 use crate::theme::Theme;
@@ -52,6 +57,33 @@ pub enum AppMode {
     FilePane,
 }
 
+/// A clickable region tracked by `ui()` for mouse interaction.
+pub struct ClickRegion {
+    pub rect: Rect,
+    pub action: ClickAction,
+}
+
+/// Action triggered when the user clicks a `ClickRegion`.
+pub enum ClickAction {
+    FocusChat,
+    FocusFilePane,
+    CopyTicket,
+    DownloadTransfer(iroh_blobs::Hash),
+    OpenTransfer(iroh_blobs::Hash),
+}
+
+/// Parameters for `App::media()`, bundled to avoid too many arguments.
+pub struct MediaInfo {
+    pub message_id: MessageId,
+    pub timestamp_ms: u64,
+    pub nickname: String,
+    pub filename: String,
+    pub size: u64,
+    pub hash: [u8; 32],
+    pub mime_type: String,
+    pub endpoint_id: iroh::EndpointId,
+}
+
 /// A single line in the chat message log.
 ///
 /// This enum demonstrates Rust's *algebraic data types*. Each variant can hold
@@ -67,7 +99,20 @@ pub enum ChatLine {
     /// The room's shareable ticket string, displayed prominently
     Ticket(String),
     /// A chat message from a peer, with their display name
-    Chat { nickname: String, text: String },
+    Chat {
+        nickname: String,
+        text: String,
+        timestamp_ms: u64,
+    },
+    /// A media file offer (image or video) displayed as an inline card.
+    Media {
+        timestamp_ms: u64,
+        nickname: String,
+        filename: String,
+        size: u64,
+        hash: [u8; 32],
+        mime_type: String,
+    },
 }
 
 /// The main application state for the chat session.
@@ -103,6 +148,20 @@ pub struct App {
     pub transfers: TransferManager,
     /// The active color theme (dark or light), toggled with Ctrl+T.
     pub theme: Theme,
+    /// Serializable history log for sync with new peers.
+    pub history: Vec<HistoryEntry>,
+    /// O(1) dedup set of message IDs already seen.
+    pub seen_ids: HashSet<MessageId>,
+    /// Whether we have already received a history sync from another peer.
+    pub history_synced: bool,
+    /// Scroll offset for the messages pane (0 = auto-scroll to bottom).
+    pub scroll_offset: u16,
+    /// Clickable regions populated each frame by `ui()`.
+    pub click_regions: Vec<ClickRegion>,
+    /// The room's ticket string, stored for clipboard copy.
+    pub ticket_str: Option<String>,
+    /// When set, the copy button shows "Copied!" until this instant.
+    pub copy_feedback_until: Option<Instant>,
 }
 
 /// The `impl` block contains methods associated with the `App` type.
@@ -128,6 +187,13 @@ impl App {
             file_picker: None,
             transfers: TransferManager::new(),
             theme: Theme::dark(),
+            history: Vec::new(),
+            seen_ids: HashSet::new(),
+            history_synced: false,
+            scroll_offset: 0,
+            click_regions: Vec::new(),
+            ticket_str: None,
+            copy_feedback_until: None,
         }
     }
 
@@ -181,9 +247,58 @@ impl App {
         self.messages.push(ChatLine::Ticket(ticket.into()));
     }
 
-    /// Append a chat message to the message log.
-    pub fn chat(&mut self, nickname: String, text: String) {
-        self.messages.push(ChatLine::Chat { nickname, text });
+    /// Append a chat message to the message log and history.
+    pub fn chat(
+        &mut self,
+        nickname: String,
+        text: String,
+        message_id: MessageId,
+        timestamp_ms: u64,
+    ) {
+        self.seen_ids.insert(message_id);
+        self.messages.push(ChatLine::Chat {
+            nickname: nickname.clone(),
+            text: text.clone(),
+            timestamp_ms,
+        });
+        self.push_history(HistoryEntry {
+            message_id,
+            timestamp_ms,
+            kind: HistoryEntryKind::Chat { nickname, text },
+        });
+    }
+
+    /// Append a media file offer to the message log and history.
+    pub fn media(&mut self, info: MediaInfo) {
+        self.seen_ids.insert(info.message_id);
+        self.messages.push(ChatLine::Media {
+            timestamp_ms: info.timestamp_ms,
+            nickname: info.nickname.clone(),
+            filename: info.filename.clone(),
+            size: info.size,
+            hash: info.hash,
+            mime_type: info.mime_type.clone(),
+        });
+        self.push_history(HistoryEntry {
+            message_id: info.message_id,
+            timestamp_ms: info.timestamp_ms,
+            kind: HistoryEntryKind::FileOffer {
+                nickname: info.nickname,
+                endpoint_id: info.endpoint_id,
+                filename: info.filename,
+                size: info.size,
+                hash: info.hash,
+                mime_type: Some(info.mime_type),
+            },
+        });
+    }
+
+    /// Push a history entry, capping at 1000 entries.
+    pub fn push_history(&mut self, entry: HistoryEntry) {
+        self.history.push(entry);
+        if self.history.len() > 1000 {
+            self.history.remove(0);
+        }
     }
 }
 
@@ -193,16 +308,24 @@ impl App {
 // the entire UI from scratch based on current state. No retained widget tree,
 // no diffing — just draw what the state says. This is simple and fast for TUIs.
 
+/// Format a unix timestamp (ms) as `HH:MM` UTC.
+fn format_timestamp(ts_ms: u64) -> String {
+    let secs = (ts_ms / 1000) as i64;
+    let hours = (secs / 3600) % 24;
+    let minutes = (secs / 60) % 60;
+    format!("{hours:02}:{minutes:02}")
+}
+
 /// Render the chat UI into a terminal frame.
 ///
-/// `&App` is an immutable borrow — the UI function only *reads* the state,
-/// it never modifies it. This is enforced at compile time: you literally cannot
-/// mutate through a `&` reference. This is a key Rust safety guarantee.
+/// Takes `&mut App` because it rebuilds `click_regions` each frame.
 ///
 /// `ratatui::Frame` is a mutable drawing surface for one frame. It provides
 /// `render_widget()` to place widgets at specific screen rectangles, and
 /// `set_cursor_position()` to show the blinking cursor.
-pub fn ui(f: &mut ratatui::Frame, app: &App) {
+pub fn ui(f: &mut ratatui::Frame, app: &mut App) {
+    // Clear click regions — they're rebuilt every frame.
+    app.click_regions.clear();
     // Paint the full-screen background so the theme bg covers the terminal area.
     let bg_block = Block::default().style(Style::default().bg(app.theme.bg));
     f.render_widget(bg_block, f.area());
@@ -237,41 +360,120 @@ pub fn ui(f: &mut ratatui::Frame, app: &App) {
     // pattern — lazy evaluation, zero allocation overhead (the compiler fuses
     // the iterator chain into a single loop).
     let theme = &app.theme;
-    let lines: Vec<Line> = app
-        .messages
-        .iter()
-        .map(|msg| match msg {
-            ChatLine::System(text) => Line::from(Span::styled(
-                format!("[system] {text}"),
-                Style::default()
-                    .fg(theme.text_dim)
-                    .add_modifier(Modifier::ITALIC),
-            )),
-            ChatLine::Ticket(ticket) => Line::from(vec![
-                Span::styled(
-                    "Ticket: ",
+    let mut lines: Vec<Line> = Vec::new();
+    // Track (line_index, hash) for each media card action line so we can
+    // register click regions after computing the scroll offset.
+    let mut media_action_lines: Vec<(usize, [u8; 32])> = Vec::new();
+    for msg in &app.messages {
+        match msg {
+            ChatLine::System(text) => {
+                lines.push(Line::from(Span::styled(
+                    format!("[system] {text}"),
                     Style::default()
-                        .fg(theme.ticket_label)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(ticket.as_str(), Style::default().fg(theme.ticket_value)),
-            ]),
-            ChatLine::Chat { nickname, text } => Line::from(vec![
-                Span::styled(
-                    nickname.as_str(),
-                    Style::default()
-                        .fg(theme.nickname)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!(": {text}"), Style::default().fg(theme.text)),
-            ]),
-        })
-        .collect();
+                        .fg(theme.text_dim)
+                        .add_modifier(Modifier::ITALIC),
+                )));
+            }
+            ChatLine::Ticket(ticket) => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "Ticket: ",
+                        Style::default()
+                            .fg(theme.ticket_label)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(ticket.as_str(), Style::default().fg(theme.ticket_value)),
+                ]));
+            }
+            ChatLine::Chat {
+                nickname,
+                text,
+                timestamp_ms,
+            } => {
+                let ts = format_timestamp(*timestamp_ms);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{ts} "),
+                        Style::default().fg(theme.timestamp),
+                    ),
+                    Span::styled(
+                        nickname.as_str(),
+                        Style::default()
+                            .fg(theme.nickname)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!(": {text}"), Style::default().fg(theme.text)),
+                ]));
+            }
+            ChatLine::Media {
+                timestamp_ms,
+                nickname,
+                filename,
+                size,
+                hash,
+                mime_type,
+            } => {
+                let ts = format_timestamp(*timestamp_ms);
+                let size_str = transfer::format_file_size(*size);
+                let media_label = if transfer::is_image_mime(mime_type) {
+                    "an image"
+                } else {
+                    "a video"
+                };
+                // Extract short type tag from mime (e.g. "jpeg" from "image/jpeg")
+                let type_tag = mime_type
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("file");
+
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{ts} "), Style::default().fg(theme.timestamp)),
+                    Span::styled(
+                        nickname.as_str(),
+                        Style::default()
+                            .fg(theme.nickname)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" shared {media_label}:"),
+                        Style::default().fg(theme.text_dim),
+                    ),
+                ]));
+                // Card top border
+                lines.push(Line::from(Span::styled(
+                    "     \u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}",
+                    Style::default().fg(theme.media_card_border),
+                )));
+                // Card content line
+                let content = format!("{filename} ({size_str}) [{type_tag}]");
+                let padded = format!("     \u{2502} {content:<29}\u{2502}");
+                lines.push(Line::from(Span::styled(
+                    padded,
+                    Style::default().fg(theme.text).bg(theme.media_card_bg),
+                )));
+                // Card action line — track its index for click region registration.
+                let actions = "     \u{2502} \u{2193} download  \u{2502}  \u{23ce} open       \u{2502}";
+                let action_line_idx = lines.len();
+                lines.push(Line::from(Span::styled(
+                    actions,
+                    Style::default().fg(theme.accent).bg(theme.media_card_bg),
+                )));
+                media_action_lines.push((action_line_idx, *hash));
+                // Card bottom border
+                lines.push(Line::from(Span::styled(
+                    "     \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}",
+                    Style::default().fg(theme.media_card_border),
+                )));
+            }
+        }
+    }
 
     // Auto-scroll: calculate how many lines to skip so the newest messages
     // are always visible. `saturating_sub` returns 0 instead of underflowing.
+    // `scroll_offset` allows manual scrollback via mouse wheel.
     let visible = top[0].height.saturating_sub(2) as usize;
-    let scroll = lines.len().saturating_sub(visible) as u16;
+    let max_scroll = lines.len().saturating_sub(visible) as u16;
+    let scroll = max_scroll.saturating_sub(app.scroll_offset.min(max_scroll));
 
     let messages_widget = Paragraph::new(lines)
         .scroll((scroll, 0))
@@ -285,7 +487,56 @@ pub fn ui(f: &mut ratatui::Frame, app: &App) {
         );
     f.render_widget(messages_widget, top[0]);
 
+    // Register click regions for media card action lines that are visible
+    // after scrolling. Each action line covers the full width of the inner
+    // area — the entire row acts as a download trigger.
+    let inner_x = top[0].x + 1;
+    let inner_y = top[0].y + 1;
+    let inner_w = top[0].width.saturating_sub(2);
+    for (line_idx, hash) in &media_action_lines {
+        let idx = *line_idx as u16;
+        if idx >= scroll && idx - scroll < visible as u16 {
+            let screen_y = inner_y + (idx - scroll);
+            let blob_hash = iroh_blobs::Hash::from_bytes(*hash);
+            // Check transfer state to decide which action to register.
+            let is_complete = app
+                .transfers
+                .entries
+                .iter()
+                .any(|e| e.offer.hash == blob_hash && matches!(e.state, transfer::TransferState::Complete(_)));
+            let action = if is_complete {
+                ClickAction::OpenTransfer(blob_hash)
+            } else {
+                ClickAction::DownloadTransfer(blob_hash)
+            };
+            app.click_regions.push(ClickRegion {
+                rect: Rect {
+                    x: inner_x,
+                    y: screen_y,
+                    width: inner_w,
+                    height: 1,
+                },
+                action,
+            });
+        }
+    }
+
+    // Register click region for messages pane → focus chat (lower priority).
+    app.click_regions.push(ClickRegion {
+        rect: top[0],
+        action: ClickAction::FocusChat,
+    });
+
     // ── Peers pane (top right) ───────────────────────────────────────────
+
+    // Split the peers area: peer list on top, copy-ticket button on bottom.
+    let show_copy_btn = app.ticket_str.is_some();
+    let btn_height = if show_copy_btn { 3 } else { 0 };
+    let peers_split = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(btn_height),
+    ])
+    .split(top[1]);
 
     // `.values()` iterates only over the `PeerInfo` values in the BTreeMap,
     // skipping the keys. The `match` on `peer.conn_type` maps each connection
@@ -313,7 +564,44 @@ pub fn ui(f: &mut ratatui::Frame, app: &App) {
             .title("peers")
             .title_style(Style::default().fg(theme.title)),
     );
-    f.render_widget(peers_widget, top[1]);
+    f.render_widget(peers_widget, peers_split[0]);
+
+    // Render the copy-ticket button below the peer list.
+    if show_copy_btn {
+        let is_feedback = app
+            .copy_feedback_until
+            .is_some_and(|t| t > Instant::now());
+        let (label, style) = if is_feedback {
+            (
+                " Copied! ",
+                Style::default()
+                    .fg(theme.bg)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (
+                " Copy Ticket (Ctrl+Y) ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
+        let btn = Paragraph::new(Line::from(Span::styled(label, style)))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .style(Style::default().bg(theme.bg))
+                    .border_style(Style::default().fg(theme.accent)),
+            );
+        f.render_widget(btn, peers_split[1]);
+
+        app.click_regions.push(ClickRegion {
+            rect: peers_split[1],
+            action: ClickAction::CopyTicket,
+        });
+    }
 
     // ── Input pane (bottom, full width) ──────────────────────────────────
 
@@ -342,6 +630,12 @@ pub fn ui(f: &mut ratatui::Frame, app: &App) {
     );
     f.render_widget(input_widget, rows[input_row]);
 
+    // Register click region for input bar → focus chat.
+    app.click_regions.push(ClickRegion {
+        rect: rows[input_row],
+        action: ClickAction::FocusChat,
+    });
+
     // Place the terminal cursor at the user's typing position.
     // `x + 2` accounts for the border (1) and the "> " prompt prefix (1 for ">").
     // Wait — actually it's: border(1) + ">" (1) + space is included in the +2.
@@ -356,6 +650,48 @@ pub fn ui(f: &mut ratatui::Frame, app: &App) {
     if app.transfers.has_entries() {
         let focused = matches!(app.mode, AppMode::FilePane);
         transfer::render_file_pane(f, rows[1], &app.transfers, focused, theme);
+
+        // Register per-entry click regions for download/open actions.
+        // Inner area is the pane area minus the 1-cell border on each side.
+        let inner = Rect {
+            x: rows[1].x + 1,
+            y: rows[1].y + 1,
+            width: rows[1].width.saturating_sub(2),
+            height: rows[1].height.saturating_sub(2),
+        };
+        for (i, entry) in app.transfers.entries.iter().enumerate() {
+            let row_y = inner.y + i as u16;
+            if row_y >= inner.y + inner.height {
+                break;
+            }
+            let entry_rect = Rect {
+                x: inner.x,
+                y: row_y,
+                width: inner.width,
+                height: 1,
+            };
+            let action = match &entry.state {
+                transfer::TransferState::Pending => {
+                    Some(ClickAction::DownloadTransfer(entry.offer.hash))
+                }
+                transfer::TransferState::Complete(_) => {
+                    Some(ClickAction::OpenTransfer(entry.offer.hash))
+                }
+                _ => None,
+            };
+            if let Some(action) = action {
+                app.click_regions.push(ClickRegion {
+                    rect: entry_rect,
+                    action,
+                });
+            }
+        }
+
+        // Register click region for file pane → focus file pane (lower priority).
+        app.click_regions.push(ClickRegion {
+            rect: rows[1],
+            action: ClickAction::FocusFilePane,
+        });
     }
 
     // ── File picker overlay (on top of everything) ───────────────────
@@ -408,11 +744,15 @@ mod tests {
     #[test]
     fn app_chat_message() {
         let mut app = App::new();
-        app.chat("Alice".into(), "hey there".into());
+        let mid = crate::net::new_message_id();
+        app.chat("Alice".into(), "hey there".into(), mid, 1700000000000);
         assert_eq!(app.messages.len(), 1);
         assert!(
-            matches!(&app.messages[0], ChatLine::Chat { nickname, text } if nickname == "Alice" && text == "hey there")
+            matches!(&app.messages[0], ChatLine::Chat { nickname, text, .. } if nickname == "Alice" && text == "hey there")
         );
+        // Also check it was recorded in history.
+        assert_eq!(app.history.len(), 1);
+        assert!(app.seen_ids.contains(&mid));
     }
 
     /// Verify that `system()` accepts both `&str` and `String` (via `impl Into<String>`).
@@ -429,7 +769,12 @@ mod tests {
     fn app_messages_accumulate_in_order() {
         let mut app = App::new();
         app.system("first");
-        app.chat("Bob".into(), "second".into());
+        app.chat(
+            "Bob".into(),
+            "second".into(),
+            crate::net::new_message_id(),
+            1000,
+        );
         app.ticket("third");
         assert_eq!(app.messages.len(), 3);
         assert!(matches!(&app.messages[0], ChatLine::System(_)));

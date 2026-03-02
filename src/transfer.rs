@@ -251,6 +251,34 @@ impl TransferManager {
     }
 }
 
+// ── MIME detection ───────────────────────────────────────────────────────────
+
+/// Infer a MIME type from a filename extension.
+/// Returns `None` for unrecognized extensions.
+pub fn mime_from_extension(filename: &str) -> Option<String> {
+    let ext = filename.rsplit('.').next()?.to_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png".into()),
+        "jpg" | "jpeg" => Some("image/jpeg".into()),
+        "gif" => Some("image/gif".into()),
+        "webp" => Some("image/webp".into()),
+        "mp4" => Some("video/mp4".into()),
+        "webm" => Some("video/webm".into()),
+        "mov" => Some("video/quicktime".into()),
+        _ => None,
+    }
+}
+
+/// Check if a MIME type is an image.
+pub fn is_image_mime(mime: &str) -> bool {
+    mime.starts_with("image/")
+}
+
+/// Check if a MIME type is a video.
+pub fn is_video_mime(mime: &str) -> bool {
+    mime.starts_with("video/")
+}
+
 // ── Rendering ────────────────────────────────────────────────────────────────
 
 /// Format a byte count as a human-readable file size string.
@@ -516,5 +544,49 @@ mod tests {
         assert_eq!(format_file_size(1536), "1.5 KB");
         assert_eq!(format_file_size(1048576), "1.0 MB");
         assert_eq!(format_file_size(1073741824), "1.0 GB");
+    }
+
+    #[test]
+    fn mime_from_extension_images() {
+        assert_eq!(mime_from_extension("photo.png"), Some("image/png".into()));
+        assert_eq!(mime_from_extension("pic.jpg"), Some("image/jpeg".into()));
+        assert_eq!(
+            mime_from_extension("pic.JPEG"),
+            Some("image/jpeg".into())
+        );
+        assert_eq!(mime_from_extension("anim.gif"), Some("image/gif".into()));
+        assert_eq!(
+            mime_from_extension("img.webp"),
+            Some("image/webp".into())
+        );
+    }
+
+    #[test]
+    fn mime_from_extension_videos() {
+        assert_eq!(mime_from_extension("clip.mp4"), Some("video/mp4".into()));
+        assert_eq!(
+            mime_from_extension("vid.webm"),
+            Some("video/webm".into())
+        );
+        assert_eq!(
+            mime_from_extension("movie.mov"),
+            Some("video/quicktime".into())
+        );
+    }
+
+    #[test]
+    fn mime_from_extension_unknown() {
+        assert_eq!(mime_from_extension("doc.txt"), None);
+        assert_eq!(mime_from_extension("archive.zip"), None);
+        assert_eq!(mime_from_extension("noext"), None);
+    }
+
+    #[test]
+    fn is_image_and_video_mime() {
+        assert!(is_image_mime("image/png"));
+        assert!(is_image_mime("image/jpeg"));
+        assert!(!is_image_mime("video/mp4"));
+        assert!(is_video_mime("video/mp4"));
+        assert!(!is_video_mime("image/png"));
     }
 }

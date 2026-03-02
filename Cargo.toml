@@ -15,6 +15,10 @@ license = "MIT OR Apache-2.0"
 # `Result<T>` is shorthand for `Result<T, anyhow::Error>`.
 anyhow = "1"
 
+# Base64 encoding for OSC 52 clipboard escape sequences.
+# Already a transitive dependency via iroh — adding it directly costs nothing.
+base64 = "0.22"
+
 # Command-line argument parser. The "derive" feature enables `#[derive(Parser)]`
 # which auto-generates a CLI parser from your struct/enum definitions at compile time.
 # Without "derive", you'd have to build the parser programmatically.
