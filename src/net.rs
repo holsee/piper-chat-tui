@@ -1,22 +1,14 @@
 //! Networking primitives: wire protocol, tickets, and connection tracking.
 //!
 //! This module contains all the types that cross the network boundary —
-//! the messages peers send each other, the ticket that bootstraps a room,
-//! and the hook that tracks whether connections are direct or relayed.
+//! the messages peers send each other, and the ticket that bootstraps a room.
 
-// Standard library imports — grouped by module as is idiomatic in Rust.
-// `HashMap` is a hash-based map; `BTreeSet` is a sorted set backed by a B-tree.
-use std::collections::{BTreeSet, HashMap};
-// `Arc` (Atomic Reference Counted) enables shared ownership across threads.
-// `RwLock` allows many concurrent readers OR one exclusive writer.
-use std::sync::{Arc, RwLock};
+// Standard library imports — `BTreeSet` is a sorted set backed by a B-tree.
+use std::collections::BTreeSet;
 
 // `anyhow::Result` is a convenient alias for `Result<T, anyhow::Error>`.
 // It lets any error type that implements `std::error::Error` be returned with `?`.
 use anyhow::Result;
-// Iroh endpoint types — `EndpointHooks` is a *trait* (Rust's interface/protocol)
-// that lets us intercept connection lifecycle events.
-use iroh::endpoint::{AfterHandshakeOutcome, ConnectionInfo, EndpointHooks};
 // `EndpointId` is a unique cryptographic identifier for each peer node.
 use iroh::EndpointId;
 // `TopicId` identifies a gossip topic (chat room) — a 32-byte hash.
@@ -228,6 +220,8 @@ pub enum ConnType {
     /// Traffic is being relayed through a DERP server — higher latency but
     /// works even when both peers are behind restrictive NATs.
     Relay,
+    /// The local user's own entry — displayed as `[you]` in the peers panel.
+    You,
 }
 
 /// Display information about a connected peer.
@@ -239,100 +233,9 @@ pub struct PeerInfo {
     /// Display name — either their chosen nickname (after receiving a Join message)
     /// or a short hex prefix of their endpoint ID (before they identify themselves).
     pub name: String,
-    /// Current connection type — updated periodically from the `ConnTracker`.
+    /// Current connection type — updated periodically by querying live
+    /// connection info from the iroh `Endpoint`.
     pub conn_type: ConnType,
-}
-
-/// Thread-safe connection tracker using interior mutability.
-///
-/// This is a *newtype pattern* — a single-field tuple struct that wraps an
-/// inner type to give it a distinct name and impl blocks. The inner type
-/// `Arc<RwLock<HashMap<...>>>` combines three Rust concurrency primitives:
-///
-/// - `Arc` (Atomic Reference Count): shared ownership across threads. Cloning
-///   an Arc increments a counter; dropping it decrements. When the count hits
-///   zero the inner value is dropped.
-/// - `RwLock`: allows many concurrent readers (`read()`) or one exclusive
-///   writer (`write()`). Unlike `Mutex`, readers don't block each other.
-/// - `HashMap`: the actual key→value store mapping endpoint IDs to connection
-///   info.
-///
-/// `#[derive(Debug)]` auto-generates a `Debug` implementation so the struct
-/// can be printed with `{:?}` formatting — useful for logging.
-#[derive(Debug)]
-pub struct ConnTracker(Arc<RwLock<HashMap<EndpointId, ConnectionInfo>>>);
-
-impl ConnTracker {
-    /// Create a new empty tracker.
-    ///
-    /// `Arc::default()` creates an `Arc<RwLock<HashMap<...>>>` where the
-    /// HashMap is empty. Rust infers all the generic types from the struct's
-    /// field type.
-    pub fn new() -> Self {
-        Self(Arc::default())
-    }
-
-    /// Create a hook that shares the same backing map.
-    ///
-    /// `self.0` accesses the first (only) field of a tuple struct.
-    /// `.clone()` on an `Arc` is cheap — it just increments the reference
-    /// count. Both the `ConnTracker` and the returned `ConnTrackerHook` will
-    /// point to the same underlying `RwLock<HashMap<...>>`.
-    pub fn hook(&self) -> ConnTrackerHook {
-        ConnTrackerHook(self.0.clone())
-    }
-
-    /// Look up the connection type for a given peer.
-    ///
-    /// This demonstrates Rust's *match guard* syntax: `Some(p) if p.is_ip()`
-    /// matches only when the guard condition is true. Guards provide a way to
-    /// add arbitrary boolean conditions to match arms.
-    ///
-    /// `.and_then()` is a combinator on `Option` — it chains a closure that
-    /// itself returns an `Option`, flattening `Option<Option<T>>` to `Option<T>`.
-    pub fn conn_type(&self, id: &EndpointId) -> ConnType {
-        let map = self.0.read().unwrap();
-        match map.get(id).and_then(|c| c.selected_path()) {
-            Some(p) if p.is_ip() => ConnType::Direct,
-            Some(_) => ConnType::Relay,
-            None => ConnType::Unknown,
-        }
-    }
-}
-
-/// Endpoint hook that records connection info after each QUIC handshake.
-///
-/// This is a separate newtype (rather than making `ConnTracker` implement
-/// `EndpointHooks` directly) because the hook needs to be `Send + Sync` and
-/// move into the iroh endpoint, while `ConnTracker` stays with the main thread.
-#[derive(Debug)]
-pub struct ConnTrackerHook(Arc<RwLock<HashMap<EndpointId, ConnectionInfo>>>);
-
-/// Implement the `EndpointHooks` trait to intercept new connections.
-///
-/// The lifetime annotations `'a` here tell the compiler that:
-/// - The returned `Future` borrows `self` and `conn` for lifetime `'a`
-/// - The future must not outlive either of those borrows
-///
-/// `impl Future<...> + Send + 'a` is Rust's "return-position impl Trait"
-/// syntax — it means "I return *some* type that implements Future, is Send,
-/// and lives at least as long as 'a". The caller doesn't know the concrete
-/// type (it's opaque), which lets the compiler optimize away the vtable.
-impl EndpointHooks for ConnTrackerHook {
-    fn after_handshake<'a>(
-        &'a self,
-        conn: &'a ConnectionInfo,
-    ) -> impl std::future::Future<Output = AfterHandshakeOutcome> + Send + 'a {
-        // `.write().unwrap()` acquires the write lock (panics if poisoned).
-        // We insert the connection info keyed by the remote peer's ID.
-        self.0
-            .write()
-            .unwrap()
-            .insert(conn.remote_id(), conn.clone());
-        // Return a future that immediately resolves to "accept the connection".
-        // `async { value }` creates a zero-cost future that yields `value`.
-        async { AfterHandshakeOutcome::accept() }
-    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -555,13 +458,4 @@ mod tests {
         assert_eq!(decoded[1].timestamp_ms, 2000);
     }
 
-    /// Test that `ConnTracker::new()` starts empty and returns `Unknown` for
-    /// any peer.
-    #[test]
-    fn conn_tracker_unknown_by_default() {
-        let tracker = ConnTracker::new();
-        let id = iroh::EndpointId::from_bytes(&[42u8; 32]).unwrap();
-        // A freshly-created tracker has no entries, so all lookups return Unknown
-        assert!(matches!(tracker.conn_type(&id), ConnType::Unknown));
-    }
 }

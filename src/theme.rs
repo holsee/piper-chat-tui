@@ -51,6 +51,7 @@ pub struct Theme {
     pub conn_direct: Color,
     pub conn_relay: Color,
     pub conn_unknown: Color,
+    pub conn_you: Color,
 
     // ── Transfer states ──────────────────────────────────────────────────
     pub transfer_pending: Color,
@@ -109,6 +110,7 @@ impl Theme {
             conn_direct: Color::Rgb(100, 220, 100),
             conn_relay: Color::Rgb(220, 180, 100),
             conn_unknown: Color::Rgb(100, 100, 110),
+            conn_you: Color::Rgb(180, 130, 255),
 
             transfer_pending: Color::Rgb(220, 180, 100),
             transfer_progress: Color::Rgb(100, 220, 100),
@@ -162,6 +164,7 @@ impl Theme {
             conn_direct: Color::Rgb(30, 140, 30),
             conn_relay: Color::Rgb(160, 100, 20),
             conn_unknown: Color::Rgb(140, 130, 150),
+            conn_you: Color::Rgb(120, 60, 200),
 
             transfer_pending: Color::Rgb(160, 100, 20),
             transfer_progress: Color::Rgb(30, 140, 30),

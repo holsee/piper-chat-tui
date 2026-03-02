@@ -86,7 +86,7 @@ use tokio::time::{Duration, interval};
 // into scope so we can write `App` instead of `chat::App`.
 use chat::{ui, App, AppMode, ClickAction, MediaInfo};
 use filepicker::FilePickerResult;
-use net::{ChatTicket, ConnTracker, ConnType, Message, PeerInfo, new_message_id, now_ms};
+use net::{ChatTicket, ConnType, Message, PeerInfo, new_message_id, now_ms};
 use transfer::{FileOffer, TransferEvent, TransferState};
 use welcome::{run_welcome_screen, WelcomeResult};
 
@@ -179,10 +179,6 @@ async fn main() -> Result<()> {
 
     // ── Networking ───────────────────────────────────────────────────────────
 
-    // `ConnTracker` uses `Arc<RwLock<HashMap>>` internally for thread-safe
-    // connection state tracking (see net.rs for details).
-    let conn_tracker = ConnTracker::new();
-
     // Build the iroh endpoint using the builder pattern. The endpoint is our
     // network identity — it generates a keypair, listens for QUIC connections,
     // and manages hole-punching and relay fallback.
@@ -193,13 +189,9 @@ async fn main() -> Result<()> {
     // endpoint can handle both gossip messages and blob transfers over the same
     // QUIC connection.
     //
-    // `.hooks()` installs our connection tracker hook, which records connection
-    // info after each QUIC handshake completes.
-    //
     // `.bind()` is async — it binds a UDP socket and starts the endpoint.
     let endpoint = iroh::Endpoint::builder()
         .alpns(vec![GOSSIP_ALPN.to_vec(), BLOBS_ALPN.to_vec()])
-        .hooks(conn_tracker.hook())
         .bind()
         .await?;
 
@@ -309,7 +301,7 @@ async fn main() -> Result<()> {
         our_id,
         PeerInfo {
             name: format!("{nickname} (you)"),
-            conn_type: ConnType::Unknown,
+            conn_type: ConnType::You,
         },
     );
     app.ticket(ticket_str.clone());
@@ -895,13 +887,43 @@ async fn main() -> Result<()> {
             }
 
             // ── Branch 5: UI tick (50ms) ─────────────────────────────────
-            // The tick branch fires every 50ms. We use it to poll connection
-            // types — iroh may upgrade connections from relay to direct (via
-            // UDP hole-punching) at any time, so we check periodically.
+            // The tick branch fires every 50ms. We query live connection info
+            // from the endpoint — iroh may upgrade connections from relay to
+            // direct (via UDP hole-punching) at any time.
             _ = tick.tick() => {
-                for (id, peer) in &mut app.peers {
-                    if *id != our_id {
-                        peer.conn_type = conn_tracker.conn_type(id);
+                // Collect peer IDs first to avoid holding a mutable borrow
+                // on `app.peers` across the await point.
+                let peer_ids: Vec<_> = app.peers.keys()
+                    .filter(|id| **id != our_id)
+                    .copied()
+                    .collect();
+                for id in peer_ids {
+                    let conn_type = match endpoint.remote_info(id).await {
+                        Some(info) => {
+                            // A peer can have multiple active addresses (relay + direct).
+                            // Prefer direct (IP) if any active address is direct.
+                            use iroh::endpoint::TransportAddrUsage;
+                            let mut has_relay = false;
+                            let mut has_direct = false;
+                            for a in info.addrs().filter(|a| matches!(a.usage(), TransportAddrUsage::Active)) {
+                                if a.addr().is_ip() {
+                                    has_direct = true;
+                                } else {
+                                    has_relay = true;
+                                }
+                            }
+                            if has_direct {
+                                ConnType::Direct
+                            } else if has_relay {
+                                ConnType::Relay
+                            } else {
+                                ConnType::Unknown
+                            }
+                        }
+                        None => ConnType::Unknown,
+                    };
+                    if let Some(peer) = app.peers.get_mut(&id) {
+                        peer.conn_type = conn_type;
                     }
                 }
             }

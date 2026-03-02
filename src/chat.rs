@@ -560,14 +560,18 @@ pub fn ui(f: &mut ratatui::Frame, app: &mut App) {
     // `.values()` iterates only over the `PeerInfo` values in the BTreeMap,
     // skipping the keys. The `match` on `peer.conn_type` maps each connection
     // type to a display tag and color.
-    let peer_lines: Vec<Line> = app
-        .peers
-        .values()
+    // Sort peers so the local user (ConnType::You) appears first, then
+    // all other peers in their existing BTreeMap order.
+    let mut sorted_peers: Vec<&PeerInfo> = app.peers.values().collect();
+    sorted_peers.sort_by_key(|p| !matches!(p.conn_type, ConnType::You));
+    let peer_lines: Vec<Line> = sorted_peers
+        .iter()
         .map(|peer| {
             let (tag, tag_color) = match peer.conn_type {
                 ConnType::Direct => ("[direct]", theme.conn_direct),
                 ConnType::Relay => ("[relay]", theme.conn_relay),
                 ConnType::Unknown => ("[?]", theme.conn_unknown),
+                ConnType::You => ("[you]", theme.conn_you),
             };
             Line::from(vec![
                 Span::styled(format!("{tag} "), Style::default().fg(tag_color)),
