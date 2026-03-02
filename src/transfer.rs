@@ -235,6 +235,21 @@ impl TransferManager {
         }
     }
 
+    /// Remove a transfer entry by its BLAKE3 hash.
+    /// Returns the filename if found and removed, or `None` if not found.
+    pub fn retract(&mut self, hash: &Hash) -> Option<String> {
+        if let Some(idx) = self.entries.iter().position(|e| e.offer.hash == *hash) {
+            let filename = self.entries[idx].offer.filename.clone();
+            self.entries.remove(idx);
+            if self.selected_index >= self.entries.len() && self.selected_index > 0 {
+                self.selected_index -= 1;
+            }
+            Some(filename)
+        } else {
+            None
+        }
+    }
+
     /// Move selection to the previous entry (wrapping around).
     ///
     /// We can't just subtract 1 because `usize` is unsigned — subtracting from 0
@@ -386,7 +401,7 @@ pub fn render_file_pane(
                     Span::styled(msg, Style::default().fg(theme.transfer_failed))
                 }
                 TransferState::Sharing => {
-                    Span::styled("[sharing]", Style::default().fg(theme.transfer_sharing))
+                    Span::styled("[unshare]", Style::default().fg(theme.transfer_sharing))
                 }
             };
 
@@ -534,6 +549,56 @@ mod tests {
         assert_eq!(m.selected_index, 0);
         m.select_prev();
         assert_eq!(m.selected_index, 0);
+    }
+
+    #[test]
+    fn retract_removes_entry() {
+        let mut m = TransferManager::new();
+        let hash = test_hash();
+        m.add_offer(test_offer("Alice"));
+        assert_eq!(m.entries.len(), 1);
+        let removed = m.retract(&hash);
+        assert_eq!(removed, Some("test.txt".into()));
+        assert!(m.entries.is_empty());
+    }
+
+    #[test]
+    fn retract_returns_none_for_missing() {
+        let mut m = TransferManager::new();
+        let hash = Hash::from_bytes([99u8; 32]);
+        assert_eq!(m.retract(&hash), None);
+    }
+
+    #[test]
+    fn retract_adjusts_selected_index() {
+        let mut m = TransferManager::new();
+        m.add_offer(test_offer("Alice"));
+        let mut offer2 = test_offer("Bob");
+        offer2.hash = Hash::from_bytes([99u8; 32]);
+        m.add_offer(offer2);
+        m.selected_index = 1;
+        // Remove the second entry (selected)
+        m.retract(&Hash::from_bytes([99u8; 32]));
+        assert_eq!(m.entries.len(), 1);
+        assert_eq!(m.selected_index, 0);
+    }
+
+    #[test]
+    fn retract_keeps_index_when_earlier_removed() {
+        let mut m = TransferManager::new();
+        m.add_offer(test_offer("Alice"));
+        let mut offer2 = test_offer("Bob");
+        offer2.hash = Hash::from_bytes([99u8; 32]);
+        m.add_offer(offer2);
+        let mut offer3 = test_offer("Charlie");
+        offer3.hash = Hash::from_bytes([88u8; 32]);
+        m.add_offer(offer3);
+        m.selected_index = 2;
+        // Remove the first entry, selected should stay in range
+        m.retract(&test_hash());
+        assert_eq!(m.entries.len(), 2);
+        // selected_index 2 >= len 2, so it adjusts to 1
+        assert_eq!(m.selected_index, 1);
     }
 
     #[test]

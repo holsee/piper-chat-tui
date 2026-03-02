@@ -70,6 +70,7 @@ pub enum ClickAction {
     CopyTicket,
     DownloadTransfer(iroh_blobs::Hash),
     OpenTransfer(iroh_blobs::Hash),
+    UnshareTransfer(iroh_blobs::Hash),
 }
 
 /// Parameters for `App::media()`, bundled to avoid too many arguments.
@@ -82,6 +83,7 @@ pub struct MediaInfo {
     pub hash: [u8; 32],
     pub mime_type: String,
     pub endpoint_id: iroh::EndpointId,
+    pub target: Option<String>,
 }
 
 /// A single line in the chat message log.
@@ -162,6 +164,9 @@ pub struct App {
     pub ticket_str: Option<String>,
     /// When set, the copy button shows "Copied!" until this instant.
     pub copy_feedback_until: Option<Instant>,
+    /// When set, the next file picker selection will send a targeted offer
+    /// to this nickname instead of broadcasting to all peers.
+    pub pending_send_target: Option<String>,
 }
 
 /// The `impl` block contains methods associated with the `App` type.
@@ -194,6 +199,7 @@ impl App {
             click_regions: Vec::new(),
             ticket_str: None,
             copy_feedback_until: None,
+            pending_send_target: None,
         }
     }
 
@@ -289,6 +295,7 @@ impl App {
                 size: info.size,
                 hash: info.hash,
                 mime_type: Some(info.mime_type),
+                target: info.target,
             },
         });
     }
@@ -473,18 +480,30 @@ pub fn ui(f: &mut ratatui::Frame, app: &mut App) {
     // `scroll_offset` allows manual scrollback via mouse wheel.
     let visible = top[0].height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(visible) as u16;
-    let scroll = max_scroll.saturating_sub(app.scroll_offset.min(max_scroll));
+    // Clamp scroll_offset so it can't exceed actual content overflow.
+    // Without this, scrolling up past the top accumulates "dead" offset
+    // that makes scrolling back down feel unresponsive.
+    app.scroll_offset = app.scroll_offset.min(max_scroll);
+    let scroll = max_scroll - app.scroll_offset;
 
+    let mut msg_block = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::default().bg(theme.bg))
+        .border_style(Style::default().fg(theme.border))
+        .title("piper-chat")
+        .title_style(Style::default().fg(theme.title));
+    if app.scroll_offset > 0 {
+        msg_block = msg_block.title_bottom(
+            Line::from(Span::styled(
+                format!(" ↑ {}/{} ", app.scroll_offset, max_scroll),
+                Style::default().fg(theme.accent),
+            ))
+            .alignment(Alignment::Right),
+        );
+    }
     let messages_widget = Paragraph::new(lines)
         .scroll((scroll, 0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .style(Style::default().bg(theme.bg))
-                .border_style(Style::default().fg(theme.border))
-                .title("piper-chat")
-                .title_style(Style::default().fg(theme.title)),
-        );
+        .block(msg_block);
     f.render_widget(messages_widget, top[0]);
 
     // Register click regions for media card action lines that are visible
@@ -676,6 +695,9 @@ pub fn ui(f: &mut ratatui::Frame, app: &mut App) {
                 }
                 transfer::TransferState::Complete(_) => {
                     Some(ClickAction::OpenTransfer(entry.offer.hash))
+                }
+                transfer::TransferState::Sharing => {
+                    Some(ClickAction::UnshareTransfer(entry.offer.hash))
                 }
                 _ => None,
             };

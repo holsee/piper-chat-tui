@@ -89,6 +89,16 @@ pub enum Message {
         timestamp_ms: u64,
         /// MIME type inferred from the file extension (e.g. "image/png").
         mime_type: Option<String>,
+        /// If `Some(name)`, only the named peer should accept this offer.
+        /// `None` means broadcast to all peers.
+        target: Option<String>,
+    },
+    /// Retract a previously shared file offer.
+    FileRetract {
+        nickname: String,
+        hash: [u8; 32],
+        message_id: MessageId,
+        timestamp_ms: u64,
     },
     /// A peer is offering its chat history as a downloadable blob.
     HistoryOffer {
@@ -126,6 +136,10 @@ pub enum HistoryEntryKind {
         size: u64,
         hash: [u8; 32],
         mime_type: Option<String>,
+        target: Option<String>,
+    },
+    FileRetract {
+        hash: [u8; 32],
     },
     System(String),
 }
@@ -429,6 +443,7 @@ mod tests {
             message_id: mid,
             timestamp_ms: 1700000000000,
             mime_type: Some("image/png".into()),
+            target: None,
         };
         let bytes = postcard::to_stdvec(&msg).unwrap();
         let decoded: Message = postcard::from_bytes(&bytes).unwrap();
@@ -442,6 +457,7 @@ mod tests {
                 message_id,
                 timestamp_ms,
                 mime_type,
+                target,
             } => {
                 assert_eq!(nickname, "Alice");
                 assert_eq!(endpoint_id, id);
@@ -451,6 +467,7 @@ mod tests {
                 assert_eq!(message_id, mid);
                 assert_eq!(timestamp_ms, 1700000000000);
                 assert_eq!(mime_type, Some("image/png".into()));
+                assert_eq!(target, None);
             }
             _ => panic!("expected FileOffer variant"),
         }

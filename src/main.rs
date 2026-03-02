@@ -382,7 +382,18 @@ async fn main() -> Result<()> {
                                     if text.trim() == "/help" {
                                         show_help(&mut app);
                                     } else if text.trim() == "/send" {
+                                        app.pending_send_target = None;
                                         app.open_file_picker();
+                                    } else if text.trim().starts_with("/sendto ") {
+                                        let target_name = text.trim().strip_prefix("/sendto ").unwrap().trim().to_string();
+                                        if target_name.is_empty() {
+                                            app.system("usage: /sendto <nickname>");
+                                        } else if app.peers.values().any(|p| p.name == target_name) {
+                                            app.pending_send_target = Some(target_name);
+                                            app.open_file_picker();
+                                        } else {
+                                            app.system(format!("unknown peer: {target_name}"));
+                                        }
                                     } else if !text.is_empty() {
                                         let mid = new_message_id();
                                         let ts = now_ms();
@@ -432,6 +443,7 @@ async fn main() -> Result<()> {
                             if let Some(picker) = &mut app.file_picker {
                                 match picker.handle(&key_event)? {
                                     FilePickerResult::Selected(path) => {
+                                        let send_target = app.pending_send_target.take();
                                         app.close_file_picker();
                                         match share_file(
                                             &blob_store,
@@ -439,6 +451,7 @@ async fn main() -> Result<()> {
                                             &nickname,
                                             our_id,
                                             &path,
+                                            send_target.clone(),
                                         ).await {
                                             Ok((hash, filename, size, mid, ts, mime_type)) => {
                                                 let offer = FileOffer {
@@ -449,6 +462,10 @@ async fn main() -> Result<()> {
                                                     hash,
                                                 };
                                                 app.transfers.add_sent(offer);
+                                                let target_label = send_target
+                                                    .as_ref()
+                                                    .map(|t| format!(" (to {t})"))
+                                                    .unwrap_or_default();
                                                 // Show media card for images/videos
                                                 if let Some(ref mt) = mime_type
                                                     && (transfer::is_image_mime(mt) || transfer::is_video_mime(mt))
@@ -462,9 +479,10 @@ async fn main() -> Result<()> {
                                                         hash: *hash.as_bytes(),
                                                         mime_type: mt.clone(),
                                                         endpoint_id: our_id,
+                                                        target: send_target,
                                                     });
                                                 } else {
-                                                    app.system(format!("sharing: {filename}"));
+                                                    app.system(format!("sharing{target_label}: {filename}"));
                                                 }
                                             }
                                             Err(e) => {
@@ -473,6 +491,7 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                     FilePickerResult::Cancelled => {
+                                        app.pending_send_target = None;
                                         app.close_file_picker();
                                     }
                                     FilePickerResult::Browsing => {}
@@ -508,17 +527,11 @@ async fn main() -> Result<()> {
                                                 );
                                             }
                                             TransferState::Complete(path) => {
-                                                // Open the folder containing the downloaded file.
-                                                // `path.parent()` returns `Option<&Path>` — the
-                                                // directory portion of the path. `unwrap_or()` falls
-                                                // back to the download dir if the path has no parent.
                                                 let dir = path.parent().unwrap_or(&download_dir);
-                                                // `open::that()` opens the path with the OS default
-                                                // handler — on Windows this launches Explorer, on
-                                                // macOS it uses Finder, on Linux it uses xdg-open.
-                                                // `let _ = ` discards the Result — we don't care if
-                                                // the open fails (e.g. no GUI available).
                                                 let _ = open::that(dir);
+                                            }
+                                            TransferState::Sharing => {
+                                                unshare_file(&mut app, &sender, &nickname).await?;
                                             }
                                             _ => {}
                                         }
@@ -534,7 +547,7 @@ async fn main() -> Result<()> {
                 if let Some(Ok(TermEvent::Mouse(mouse))) = &ev {
                     match mouse.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
-                            handle_mouse_click(
+                            let needs_unshare = handle_mouse_click(
                                 &mut app,
                                 mouse.column,
                                 mouse.row,
@@ -543,6 +556,9 @@ async fn main() -> Result<()> {
                                 &download_dir,
                                 &transfer_tx,
                             );
+                            if needs_unshare {
+                                unshare_file(&mut app, &sender, &nickname).await?;
+                            }
                         }
                         MouseEventKind::ScrollUp => {
                             // Scroll up (back in history)
@@ -580,8 +596,14 @@ async fn main() -> Result<()> {
                                     app.chat(nickname, text, message_id, timestamp_ms);
                                 }
                             }
-                            Ok(Message::FileOffer { nickname: name, endpoint_id, filename, size, hash, message_id, timestamp_ms, mime_type }) => {
+                            Ok(Message::FileOffer { nickname: name, endpoint_id, filename, size, hash, message_id, timestamp_ms, mime_type, target }) => {
                                 if app.seen_ids.contains(&message_id) {
+                                    continue;
+                                }
+                                // Skip targeted offers not meant for us.
+                                if let Some(ref t) = target
+                                    && *t != nickname
+                                {
                                     continue;
                                 }
                                 let blob_hash = Hash::from_bytes(hash);
@@ -594,6 +616,10 @@ async fn main() -> Result<()> {
                                 };
                                 app.transfers.add_offer(offer);
 
+                                let target_label = target
+                                    .as_ref()
+                                    .map(|_| " (with you)".to_string())
+                                    .unwrap_or_default();
                                 // Show as media card if it's an image/video, else system msg.
                                 if let Some(ref mt) = mime_type
                                     && (transfer::is_image_mime(mt) || transfer::is_video_mime(mt))
@@ -607,6 +633,7 @@ async fn main() -> Result<()> {
                                         hash,
                                         mime_type: mt.clone(),
                                         endpoint_id,
+                                        target,
                                     });
                                 } else {
                                     // Record in history for non-media file offers.
@@ -621,13 +648,33 @@ async fn main() -> Result<()> {
                                             size,
                                             hash,
                                             mime_type,
+                                            target,
                                         },
                                     });
                                     app.system(format!(
-                                        "{name} shared: {filename} ({})",
+                                        "{name} shared{target_label}: {filename} ({})",
                                         transfer::format_file_size(size)
                                     ));
                                 }
+                            }
+                            Ok(Message::FileRetract { nickname: name, hash, message_id, timestamp_ms }) => {
+                                if app.seen_ids.contains(&message_id) {
+                                    continue;
+                                }
+                                app.seen_ids.insert(message_id);
+                                let blob_hash = Hash::from_bytes(hash);
+                                if let Some(filename) = app.transfers.retract(&blob_hash) {
+                                    app.system(format!("{name} unshared: {filename}"));
+                                }
+                                // Remove matching FileOffer entries from history.
+                                app.history.retain(|e| {
+                                    !matches!(&e.kind, net::HistoryEntryKind::FileOffer { hash: h, .. } if *h == hash)
+                                });
+                                app.push_history(net::HistoryEntry {
+                                    message_id,
+                                    timestamp_ms,
+                                    kind: net::HistoryEntryKind::FileRetract { hash },
+                                });
                             }
                             Ok(Message::HistoryOffer { message_count, hash, endpoint_id, .. }) => {
                                 if !app.history_synced {
@@ -765,38 +812,61 @@ async fn main() -> Result<()> {
                                     app.seen_ids.insert(entry.message_id);
                                     merged += 1;
                                     match &entry.kind {
-                                        net::HistoryEntryKind::Chat { nickname, text } => {
+                                        net::HistoryEntryKind::Chat { nickname: nick, text } => {
                                             historical.push(chat::ChatLine::Chat {
-                                                nickname: nickname.clone(),
+                                                nickname: nick.clone(),
                                                 text: text.clone(),
                                                 timestamp_ms: entry.timestamp_ms,
                                             });
                                         }
                                         net::HistoryEntryKind::FileOffer {
-                                            nickname,
+                                            nickname: nick,
+                                            endpoint_id: eid,
                                             filename,
                                             size,
                                             hash,
                                             mime_type,
-                                            ..
+                                            target,
                                         } => {
+                                            // Skip targeted offers not meant for us.
+                                            if let Some(t) = target
+                                                && *t != nickname
+                                            {
+                                                continue;
+                                            }
+                                            // Add to TransferManager so synced offers are downloadable.
+                                            let blob_hash = Hash::from_bytes(*hash);
+                                            let offer = FileOffer {
+                                                sender_nickname: nick.clone(),
+                                                sender_id: *eid,
+                                                filename: filename.clone(),
+                                                size: *size,
+                                                hash: blob_hash,
+                                            };
+                                            app.transfers.add_offer(offer);
+
                                             if let Some(mt) = mime_type
                                                 && (transfer::is_image_mime(mt) || transfer::is_video_mime(mt))
                                             {
                                                 historical.push(chat::ChatLine::Media {
                                                     timestamp_ms: entry.timestamp_ms,
-                                                    nickname: nickname.clone(),
+                                                    nickname: nick.clone(),
                                                     filename: filename.clone(),
                                                     size: *size,
                                                     hash: *hash,
                                                     mime_type: mt.clone(),
                                                 });
-                                                continue;
+                                            } else {
+                                                historical.push(chat::ChatLine::System(format!(
+                                                    "{nick} shared: {filename} ({})",
+                                                    transfer::format_file_size(*size)
+                                                )));
                                             }
-                                            historical.push(chat::ChatLine::System(format!(
-                                                "{nickname} shared: {filename} ({})",
-                                                transfer::format_file_size(*size)
-                                            )));
+                                        }
+                                        net::HistoryEntryKind::FileRetract { hash } => {
+                                            // Replay retract: remove any previously-added offer.
+                                            let blob_hash = Hash::from_bytes(*hash);
+                                            app.transfers.retract(&blob_hash);
                                         }
                                         net::HistoryEntryKind::System(text) => {
                                             historical.push(chat::ChatLine::System(text.clone()));
@@ -863,8 +933,9 @@ async fn main() -> Result<()> {
 /// Display help text as system messages.
 fn show_help(app: &mut App) {
     app.system("── Commands ──────────────────────────────");
-    app.system("  /help        Show this help");
-    app.system("  /send        Open file picker to share a file");
+    app.system("  /help           Show this help");
+    app.system("  /send           Open file picker to share a file");
+    app.system("  /sendto <name>  Send a file to a specific peer");
     app.system("── Keys (chat) ───────────────────────────");
     app.system("  Enter        Send message");
     app.system("  Ctrl+F       Open file picker");
@@ -873,8 +944,8 @@ fn show_help(app: &mut App) {
     app.system("  Tab          Focus file pane (when visible)");
     app.system("  Esc          Quit");
     app.system("── Keys (file pane) ──────────────────────");
-    app.system("  Up/Down      Select file");
-    app.system("  Enter        Download selected / open folder");
+    app.system("  Up/Down      Select entry");
+    app.system("  Enter        Download / open folder / unshare");
     app.system("  Tab/Esc      Return to chat");
     app.system("── Keys (file picker) ────────────────────");
     app.system("  Up/Down      Navigate files");
@@ -890,6 +961,9 @@ fn show_help(app: &mut App) {
 // ── Mouse handling ───────────────────────────────────────────────────────────
 
 /// Handle a left mouse click by checking registered click regions.
+///
+/// Returns `true` if an unshare action was triggered and needs async
+/// processing by the caller (broadcast over gossip).
 fn handle_mouse_click(
     app: &mut App,
     col: u16,
@@ -898,7 +972,7 @@ fn handle_mouse_click(
     endpoint: &iroh::Endpoint,
     download_dir: &std::path::Path,
     transfer_tx: &tokio::sync::mpsc::Sender<TransferEvent>,
-) {
+) -> bool {
     // Iterate click regions in reverse so higher z-order (rendered last) wins.
     for region in app.click_regions.iter().rev() {
         if col >= region.rect.x
@@ -947,10 +1021,23 @@ fn handle_mouse_click(
                         let _ = open::that(dir);
                     }
                 }
+                ClickAction::UnshareTransfer(hash) => {
+                    // Select the entry so unshare_file() operates on it.
+                    if let Some(idx) = app
+                        .transfers
+                        .entries
+                        .iter()
+                        .position(|e| e.offer.hash == *hash && matches!(e.state, TransferState::Sharing))
+                    {
+                        app.transfers.selected_index = idx;
+                        return true;
+                    }
+                }
             }
             break;
         }
     }
+    false
 }
 
 // ── Clipboard helpers ────────────────────────────────────────────────────────
@@ -987,23 +1074,15 @@ async fn share_file(
     nickname: &str,
     endpoint_id: iroh::EndpointId,
     path: &std::path::Path,
+    target: Option<String>,
 ) -> Result<(Hash, String, u64, net::MessageId, u64, Option<String>)> {
-    // `file_name()` returns `Option<&OsStr>` — the last component of the path.
-    // `to_string_lossy()` converts `OsStr` to a `Cow<str>`, replacing invalid
-    // Unicode with the replacement character. `.to_string()` converts to owned.
     let filename = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unnamed".to_string());
 
-    // `tokio::fs::metadata()` is the async version of `std::fs::metadata()`.
-    // `.len()` returns the file size in bytes.
     let size = tokio::fs::metadata(path).await?.len();
 
-    // Import the file into the blob store. `add_path` returns an `AddProgress`
-    // that implements `IntoFuture` — awaiting it gives us a `TagInfo` with the
-    // BLAKE3 hash. The blob store computes the hash as it reads the file,
-    // verifying integrity. The file content is now addressable by hash.
     let tag_info = store.blobs().add_path(path).await?;
     let hash = tag_info.hash;
 
@@ -1020,11 +1099,49 @@ async fn share_file(
         message_id: mid,
         timestamp_ms: ts,
         mime_type: mime_type.clone(),
+        target,
     };
     let encoded = postcard::to_stdvec(&msg)?;
     sender.broadcast(encoded.into()).await?;
 
     Ok((hash, filename, size, mid, ts, mime_type))
+}
+
+/// Unshare the currently selected file in the file pane.
+///
+/// Broadcasts a `FileRetract` message, removes the entry from the transfer
+/// manager, and records the retraction in history.
+async fn unshare_file(
+    app: &mut App,
+    sender: &iroh_gossip::api::GossipSender,
+    nickname: &str,
+) -> Result<()> {
+    if let Some(entry) = app.transfers.selected_entry()
+        && matches!(entry.state, TransferState::Sharing)
+    {
+        let hash = entry.offer.hash;
+        let hash_bytes = *hash.as_bytes();
+        let mid = new_message_id();
+        let ts = now_ms();
+        let msg = Message::FileRetract {
+            nickname: nickname.to_string(),
+            hash: hash_bytes,
+            message_id: mid,
+            timestamp_ms: ts,
+        };
+        let encoded = postcard::to_stdvec(&msg)?;
+        sender.broadcast(encoded.into()).await?;
+        if let Some(filename) = app.transfers.retract(&hash) {
+            app.seen_ids.insert(mid);
+            app.push_history(net::HistoryEntry {
+                message_id: mid,
+                timestamp_ms: ts,
+                kind: net::HistoryEntryKind::FileRetract { hash: hash_bytes },
+            });
+            app.system(format!("You unshared: {filename}"));
+        }
+    }
+    Ok(())
 }
 
 /// Spawn a background task that downloads a blob from a remote peer and exports
