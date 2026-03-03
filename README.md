@@ -16,11 +16,10 @@
 │                                               │                      │
 │ 14:32 Bob: hey!                               │                      │
 │ 14:32 Alice: hello!                           │                      │
-│ 14:33 Charlie shared an image:                │                      │
-│    ┌────────────────────────────┐             ├──────────────────────┤
-│    │ sunset.jpg (2.4 MB) [jpeg] │             │ Copy Ticket (Ctrl+Y) │
-│    │ ↓ download  │  ⏎ open      │             ├──────────────────────┤
-│    └────────────────────────────┘             │                      │
+│ 14:33 [system] Charlie shared: sunset.jpg     │                      │
+│                                               ├──────────────────────┤
+│                                               │ Copy Ticket (Ctrl+Y) │
+│                                               ├──────────────────────┤
 ├─ files ───────────────────────────────────────┤                      │
 │ > Bob: notes.txt (12 KB)            [dl]      │                      │
 │   You: photo.png (3.1 MB)      [Sharing]      │                      │
@@ -107,7 +106,6 @@ cargo run
 - **Broadcast** &mdash; `Ctrl+F` to open file picker, share with all peers
 - **Targeted** &mdash; `/sendto <name>` to share with a specific peer only
 - **Progress** &mdash; live download bar: `[███░░░] 45%`
-- **Media cards** &mdash; images and videos render as inline cards with download/open actions
 - **Unshare** &mdash; retract a shared file at any time
 - Content-addressed via BLAKE3 &mdash; integrity verified automatically
 
@@ -146,7 +144,7 @@ Toggle with **Ctrl+T** anywhere &mdash; welcome screen, chat, file picker, all p
 
 ### Mouse Support
 
-- Click message pane, input bar, file entries, media card actions, copy ticket button
+- Click message pane, input bar, file entries, copy ticket button
 - Scroll wheel to browse message history (3 lines per tick)
 - Scroll position indicator: `↑ 5/12`
 

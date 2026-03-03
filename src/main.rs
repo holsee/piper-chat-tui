@@ -84,7 +84,7 @@ use tokio::time::{Duration, interval};
 
 // Imports from our own crate modules — `use chat::App` brings `chat::App`
 // into scope so we can write `App` instead of `chat::App`.
-use chat::{ui, App, AppMode, ClickAction, MediaInfo};
+use chat::{ui, App, AppMode, ClickAction};
 use filepicker::FilePickerResult;
 use net::{ChatTicket, ConnType, Message, PeerInfo, new_message_id, now_ms};
 use transfer::{FileOffer, TransferEvent, TransferState};
@@ -445,7 +445,7 @@ async fn main() -> Result<()> {
                                             &path,
                                             send_target.clone(),
                                         ).await {
-                                            Ok((hash, filename, size, mid, ts, mime_type)) => {
+                                            Ok((hash, filename, size, _mid, _ts, _mime_type)) => {
                                                 let offer = FileOffer {
                                                     sender_nickname: "You".to_string(),
                                                     sender_id: our_id,
@@ -458,24 +458,7 @@ async fn main() -> Result<()> {
                                                     .as_ref()
                                                     .map(|t| format!(" (to {t})"))
                                                     .unwrap_or_default();
-                                                // Show media card for images/videos
-                                                if let Some(ref mt) = mime_type
-                                                    && (transfer::is_image_mime(mt) || transfer::is_video_mime(mt))
-                                                {
-                                                    app.media(MediaInfo {
-                                                        message_id: mid,
-                                                        timestamp_ms: ts,
-                                                        nickname: "You".into(),
-                                                        filename,
-                                                        size,
-                                                        hash: *hash.as_bytes(),
-                                                        mime_type: mt.clone(),
-                                                        endpoint_id: our_id,
-                                                        target: send_target,
-                                                    });
-                                                } else {
-                                                    app.system(format!("sharing{target_label}: {filename}"));
-                                                }
+                                                app.system(format!("sharing{target_label}: {filename}"));
                                             }
                                             Err(e) => {
                                                 app.system(format!("failed to share file: {e}"));
@@ -612,42 +595,24 @@ async fn main() -> Result<()> {
                                     .as_ref()
                                     .map(|_| " (with you)".to_string())
                                     .unwrap_or_default();
-                                // Show as media card if it's an image/video, else system msg.
-                                if let Some(ref mt) = mime_type
-                                    && (transfer::is_image_mime(mt) || transfer::is_video_mime(mt))
-                                {
-                                    app.media(MediaInfo {
-                                        message_id,
-                                        timestamp_ms,
-                                        nickname: name,
-                                        filename,
+                                app.seen_ids.insert(message_id);
+                                app.push_history(net::HistoryEntry {
+                                    message_id,
+                                    timestamp_ms,
+                                    kind: net::HistoryEntryKind::FileOffer {
+                                        nickname: name.clone(),
+                                        endpoint_id,
+                                        filename: filename.clone(),
                                         size,
                                         hash,
-                                        mime_type: mt.clone(),
-                                        endpoint_id,
+                                        mime_type,
                                         target,
-                                    });
-                                } else {
-                                    // Record in history for non-media file offers.
-                                    app.seen_ids.insert(message_id);
-                                    app.push_history(net::HistoryEntry {
-                                        message_id,
-                                        timestamp_ms,
-                                        kind: net::HistoryEntryKind::FileOffer {
-                                            nickname: name.clone(),
-                                            endpoint_id,
-                                            filename: filename.clone(),
-                                            size,
-                                            hash,
-                                            mime_type,
-                                            target,
-                                        },
-                                    });
-                                    app.system(format!(
-                                        "{name} shared{target_label}: {filename} ({})",
-                                        transfer::format_file_size(size)
-                                    ));
-                                }
+                                    },
+                                });
+                                app.system(format!(
+                                    "{name} shared{target_label}: {filename} ({})",
+                                    transfer::format_file_size(size)
+                                ));
                             }
                             Ok(Message::FileRetract { nickname: name, hash, message_id, timestamp_ms }) => {
                                 if app.seen_ids.contains(&message_id) {
@@ -817,7 +782,7 @@ async fn main() -> Result<()> {
                                             filename,
                                             size,
                                             hash,
-                                            mime_type,
+                                            mime_type: _,
                                             target,
                                         } => {
                                             // Skip targeted offers not meant for us.
@@ -837,23 +802,10 @@ async fn main() -> Result<()> {
                                             };
                                             app.transfers.add_offer(offer);
 
-                                            if let Some(mt) = mime_type
-                                                && (transfer::is_image_mime(mt) || transfer::is_video_mime(mt))
-                                            {
-                                                historical.push(chat::ChatLine::Media {
-                                                    timestamp_ms: entry.timestamp_ms,
-                                                    nickname: nick.clone(),
-                                                    filename: filename.clone(),
-                                                    size: *size,
-                                                    hash: *hash,
-                                                    mime_type: mt.clone(),
-                                                });
-                                            } else {
-                                                historical.push(chat::ChatLine::System(format!(
-                                                    "{nick} shared: {filename} ({})",
-                                                    transfer::format_file_size(*size)
-                                                )));
-                                            }
+                                            historical.push(chat::ChatLine::System(format!(
+                                                "{nick} shared: {filename} ({})",
+                                                transfer::format_file_size(*size)
+                                            )));
                                         }
                                         net::HistoryEntryKind::FileRetract { hash } => {
                                             // Replay retract: remove any previously-added offer.

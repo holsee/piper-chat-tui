@@ -284,16 +284,6 @@ pub fn mime_from_extension(filename: &str) -> Option<String> {
     }
 }
 
-/// Check if a MIME type is an image.
-pub fn is_image_mime(mime: &str) -> bool {
-    mime.starts_with("image/")
-}
-
-/// Check if a MIME type is a video.
-pub fn is_video_mime(mime: &str) -> bool {
-    mime.starts_with("video/")
-}
-
 // ── Rendering ────────────────────────────────────────────────────────────────
 
 /// Format a byte count as a human-readable file size string.
@@ -646,12 +636,4 @@ mod tests {
         assert_eq!(mime_from_extension("noext"), None);
     }
 
-    #[test]
-    fn is_image_and_video_mime() {
-        assert!(is_image_mime("image/png"));
-        assert!(is_image_mime("image/jpeg"));
-        assert!(!is_image_mime("video/mp4"));
-        assert!(is_video_mime("video/mp4"));
-        assert!(!is_video_mime("image/png"));
-    }
 }

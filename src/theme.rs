@@ -75,9 +75,7 @@ pub struct Theme {
     pub input_prompt: Color,
     pub cursor_blink: Color,
 
-    // ── Media cards & timestamps ─────────────────────────────────────────
-    pub media_card_border: Color,
-    pub media_card_bg: Color,
+    // ── Timestamps ───────────────────────────────────────────────────────
     pub timestamp: Color,
 }
 
@@ -130,8 +128,6 @@ impl Theme {
             input_prompt: Color::Rgb(180, 130, 255),
             cursor_blink: Color::Rgb(100, 100, 110),
 
-            media_card_border: Color::Rgb(140, 120, 220),
-            media_card_bg: Color::Rgb(35, 30, 50),
             timestamp: Color::Rgb(100, 100, 110),
         }
     }
@@ -184,8 +180,6 @@ impl Theme {
             input_prompt: Color::Rgb(120, 60, 200),
             cursor_blink: Color::Rgb(140, 130, 150),
 
-            media_card_border: Color::Rgb(100, 60, 180),
-            media_card_bg: Color::Rgb(230, 225, 240),
             timestamp: Color::Rgb(140, 130, 150),
         }
     }

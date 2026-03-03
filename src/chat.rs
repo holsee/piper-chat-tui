@@ -73,19 +73,6 @@ pub enum ClickAction {
     UnshareTransfer(iroh_blobs::Hash),
 }
 
-/// Parameters for `App::media()`, bundled to avoid too many arguments.
-pub struct MediaInfo {
-    pub message_id: MessageId,
-    pub timestamp_ms: u64,
-    pub nickname: String,
-    pub filename: String,
-    pub size: u64,
-    pub hash: [u8; 32],
-    pub mime_type: String,
-    pub endpoint_id: iroh::EndpointId,
-    pub target: Option<String>,
-}
-
 /// A single line in the chat message log.
 ///
 /// This enum demonstrates Rust's *algebraic data types*. Each variant can hold
@@ -105,15 +92,6 @@ pub enum ChatLine {
         nickname: String,
         text: String,
         timestamp_ms: u64,
-    },
-    /// A media file offer (image or video) displayed as an inline card.
-    Media {
-        timestamp_ms: u64,
-        nickname: String,
-        filename: String,
-        size: u64,
-        hash: [u8; 32],
-        mime_type: String,
     },
 }
 
@@ -274,31 +252,6 @@ impl App {
         });
     }
 
-    /// Append a media file offer to the message log and history.
-    pub fn media(&mut self, info: MediaInfo) {
-        self.seen_ids.insert(info.message_id);
-        self.messages.push(ChatLine::Media {
-            timestamp_ms: info.timestamp_ms,
-            nickname: info.nickname.clone(),
-            filename: info.filename.clone(),
-            size: info.size,
-            hash: info.hash,
-            mime_type: info.mime_type.clone(),
-        });
-        self.push_history(HistoryEntry {
-            message_id: info.message_id,
-            timestamp_ms: info.timestamp_ms,
-            kind: HistoryEntryKind::FileOffer {
-                nickname: info.nickname,
-                endpoint_id: info.endpoint_id,
-                filename: info.filename,
-                size: info.size,
-                hash: info.hash,
-                mime_type: Some(info.mime_type),
-                target: info.target,
-            },
-        });
-    }
 
     /// Push a history entry, capping at 1000 entries.
     pub fn push_history(&mut self, entry: HistoryEntry) {
@@ -368,9 +321,6 @@ pub fn ui(f: &mut ratatui::Frame, app: &mut App) {
     // the iterator chain into a single loop).
     let theme = &app.theme;
     let mut lines: Vec<Line> = Vec::new();
-    // Track (line_index, hash) for each media card action line so we can
-    // register click regions after computing the scroll offset.
-    let mut media_action_lines: Vec<(usize, [u8; 32])> = Vec::new();
     for msg in &app.messages {
         match msg {
             ChatLine::System(text) => {
@@ -412,66 +362,6 @@ pub fn ui(f: &mut ratatui::Frame, app: &mut App) {
                     Span::styled(format!(": {text}"), Style::default().fg(theme.text)),
                 ]));
             }
-            ChatLine::Media {
-                timestamp_ms,
-                nickname,
-                filename,
-                size,
-                hash,
-                mime_type,
-            } => {
-                let ts = format_timestamp(*timestamp_ms);
-                let size_str = transfer::format_file_size(*size);
-                let media_label = if transfer::is_image_mime(mime_type) {
-                    "an image"
-                } else {
-                    "a video"
-                };
-                // Extract short type tag from mime (e.g. "jpeg" from "image/jpeg")
-                let type_tag = mime_type
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or("file");
-
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{ts} "), Style::default().fg(theme.timestamp)),
-                    Span::styled(
-                        nickname.as_str(),
-                        Style::default()
-                            .fg(theme.nickname)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!(" shared {media_label}:"),
-                        Style::default().fg(theme.text_dim),
-                    ),
-                ]));
-                // Card top border
-                lines.push(Line::from(Span::styled(
-                    "     \u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}",
-                    Style::default().fg(theme.media_card_border),
-                )));
-                // Card content line
-                let content = format!("{filename} ({size_str}) [{type_tag}]");
-                let padded = format!("     \u{2502} {content:<29}\u{2502}");
-                lines.push(Line::from(Span::styled(
-                    padded,
-                    Style::default().fg(theme.text).bg(theme.media_card_bg),
-                )));
-                // Card action line — track its index for click region registration.
-                let actions = "     \u{2502} \u{2193} download  \u{2502}  \u{23ce} open       \u{2502}";
-                let action_line_idx = lines.len();
-                lines.push(Line::from(Span::styled(
-                    actions,
-                    Style::default().fg(theme.accent).bg(theme.media_card_bg),
-                )));
-                media_action_lines.push((action_line_idx, *hash));
-                // Card bottom border
-                lines.push(Line::from(Span::styled(
-                    "     \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}",
-                    Style::default().fg(theme.media_card_border),
-                )));
-            }
         }
     }
 
@@ -505,40 +395,6 @@ pub fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .scroll((scroll, 0))
         .block(msg_block);
     f.render_widget(messages_widget, top[0]);
-
-    // Register click regions for media card action lines that are visible
-    // after scrolling. Each action line covers the full width of the inner
-    // area — the entire row acts as a download trigger.
-    let inner_x = top[0].x + 1;
-    let inner_y = top[0].y + 1;
-    let inner_w = top[0].width.saturating_sub(2);
-    for (line_idx, hash) in &media_action_lines {
-        let idx = *line_idx as u16;
-        if idx >= scroll && idx - scroll < visible as u16 {
-            let screen_y = inner_y + (idx - scroll);
-            let blob_hash = iroh_blobs::Hash::from_bytes(*hash);
-            // Check transfer state to decide which action to register.
-            let is_complete = app
-                .transfers
-                .entries
-                .iter()
-                .any(|e| e.offer.hash == blob_hash && matches!(e.state, transfer::TransferState::Complete(_)));
-            let action = if is_complete {
-                ClickAction::OpenTransfer(blob_hash)
-            } else {
-                ClickAction::DownloadTransfer(blob_hash)
-            };
-            app.click_regions.push(ClickRegion {
-                rect: Rect {
-                    x: inner_x,
-                    y: screen_y,
-                    width: inner_w,
-                    height: 1,
-                },
-                action,
-            });
-        }
-    }
 
     // Register click region for messages pane → focus chat (lower priority).
     app.click_regions.push(ClickRegion {
