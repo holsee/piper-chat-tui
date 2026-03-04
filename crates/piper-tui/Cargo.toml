@@ -1,0 +1,30 @@
+[package]
+name = "piper-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "piper-chat"
+path = "src/main.rs"
+
+[dependencies]
+piper-core.workspace = true
+
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+dirs.workspace = true
+iroh.workspace = true
+iroh-blobs.workspace = true
+iroh-gossip.workspace = true
+iroh-tickets.workspace = true
+n0-future.workspace = true
+open.workspace = true
+postcard.workspace = true
+rand.workspace = true
+ratatui.workspace = true
+ratatui-explorer.workspace = true
+serde.workspace = true
+tokio.workspace = true

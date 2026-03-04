@@ -6,9 +6,6 @@
 // Standard library imports — `BTreeSet` is a sorted set backed by a B-tree.
 use std::collections::BTreeSet;
 
-// `anyhow::Result` is a convenient alias for `Result<T, anyhow::Error>`.
-// It lets any error type that implements `std::error::Error` be returned with `?`.
-use anyhow::Result;
 // `EndpointId` is a unique cryptographic identifier for each peer node.
 use iroh::EndpointId;
 // `TopicId` identifies a gossip topic (chat room) — a 32-byte hash.
@@ -21,23 +18,10 @@ use iroh_tickets::Ticket;
 // postcard (binary), etc. — a cornerstone of Rust's zero-boilerplate approach.
 use serde::{Deserialize, Serialize};
 
-// ── Message identity & timestamps ────────────────────────────────────────────
+// ── Message identity ─────────────────────────────────────────────────────────
 
 /// A 128-bit random message identifier for deduplication during history merge.
 pub type MessageId = [u8; 16];
-
-/// Generate a new random 128-bit message ID.
-pub fn new_message_id() -> MessageId {
-    rand::random()
-}
-
-/// Current wall-clock time as milliseconds since UNIX epoch.
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
 
 // ── Wire protocol ────────────────────────────────────────────────────────────
 //
@@ -107,7 +91,7 @@ pub enum Message {
 /// A single entry in the chat history log, serialized into a blob for
 /// history sync. Separate from the wire `Message` enum so we can evolve
 /// the storage format independently.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct HistoryEntry {
     pub message_id: MessageId,
     pub timestamp_ms: u64,
@@ -115,7 +99,7 @@ pub struct HistoryEntry {
 }
 
 /// The payload of a history entry.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum HistoryEntryKind {
     Chat {
         nickname: String,
@@ -212,6 +196,7 @@ impl Ticket for ChatTicket {
 /// Iroh's QUIC connections start as relayed (through a DERP relay server) and
 /// may upgrade to direct (UDP hole-punched) once both peers discover each other's
 /// public IP. This enum tracks the current state for display in the peers panel.
+#[derive(Debug, Clone, Copy, Serialize)]
 pub enum ConnType {
     /// Connection type not yet determined (peer just connected).
     Unknown,
@@ -248,6 +233,7 @@ pub struct PeerInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::new_message_id;
 
     /// Test that a `ChatTicket` survives a serialize→deserialize round-trip.
     ///
